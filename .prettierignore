@@ -1,0 +1,13 @@
+dist
+apps/web/dist
+node_modules
+.wrangler
+work
+packages/contracts/openapi.json
+package-lock.json
+docs/
+*.md
+apps/web/index.html
+*.yaml
+*.yml
+.claude/

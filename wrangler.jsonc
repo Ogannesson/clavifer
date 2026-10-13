@@ -1,0 +1,98 @@
+// Template. The top level is the local development configuration and works as it is. Before
+// deploying an environment, replace its example.com hostname and its zeroed database_id with
+// your own, and create the D1 database and R2 bucket it names.
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "clavifer",
+  "main": "apps/worker/src/index.ts",
+  "compatibility_date": "2026-09-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "clavifer",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BACKUPS",
+      "bucket_name": "clavifer-backups",
+    },
+  ],
+  "assets": {
+    "directory": "apps/web/dist",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "not_found_handling": "single-page-application",
+  },
+  "vars": {
+    "APP_ORIGIN": "http://localhost:8787",
+    "ALLOW_LOCAL_HTTP": "true",
+  },
+  "triggers": {
+    "crons": [],
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": false,
+    },
+  },
+  "env": {
+    "staging": {
+      "name": "clavifer-staging",
+      "workers_dev": false,
+      "routes": [{ "pattern": "credentials-staging.example.com", "custom_domain": true }],
+      "vars": {
+        "APP_ORIGIN": "https://credentials-staging.example.com",
+        "ALLOW_LOCAL_HTTP": "false",
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "clavifer-staging",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "migrations",
+        },
+      ],
+      "r2_buckets": [
+        {
+          "binding": "BACKUPS",
+          "bucket_name": "clavifer-staging-backups",
+        },
+      ],
+      "triggers": {
+        "crons": ["*/15 * * * *"],
+      },
+    },
+    "production": {
+      "name": "clavifer-production",
+      "workers_dev": false,
+      "routes": [{ "pattern": "credentials.example.com", "custom_domain": true }],
+      "vars": {
+        "APP_ORIGIN": "https://credentials.example.com",
+        "ALLOW_LOCAL_HTTP": "false",
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "clavifer",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "migrations",
+        },
+      ],
+      "r2_buckets": [
+        {
+          "binding": "BACKUPS",
+          "bucket_name": "clavifer-backups",
+        },
+      ],
+      "triggers": {
+        "crons": ["*/15 * * * *"],
+      },
+    },
+  },
+}

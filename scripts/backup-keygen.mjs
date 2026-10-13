@@ -1,0 +1,10 @@
+import { generateIdentity, identityToRecipient } from 'age-encryption';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
+const file = process.argv[2];
+if (!file) throw new Error('Usage: node scripts/backup-keygen.mjs <private-identity-file.agekey>');
+const identity = await generateIdentity();
+await mkdir(dirname(file), { recursive: true });
+await writeFile(file, identity + '\n', { flag: 'wx', mode: 0o600 });
+console.log('Private identity saved to the specified file. Store it separately from the backups.');
+console.log('Public recipient: ' + (await identityToRecipient(identity)));

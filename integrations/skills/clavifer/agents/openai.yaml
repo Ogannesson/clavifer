@@ -1,0 +1,4 @@
+interface:
+  display_name: Clavifer
+  short_description: Securely use configured API credentials from CLI or MCP
+  default_prompt: Use the configured credential service for this API task.
