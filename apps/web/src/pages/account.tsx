@@ -158,7 +158,8 @@ export function Account({ app }: { app: AppApi }) {
       >
         <div className="panel-body">
           <p className="note">
-            密码至少 12 位。失去所有登录方式时只能由具备 Cloudflare 管理权限的操作者备份后恢复，过程会撤销旧会话。
+            密码至少 12 位。失去所有登录方式时，由部署这个服务的操作者签发找回令牌，在 /setup
+            页面设置新密码；这会删除全部 Passkey 和会话，安装实例和授权保留。
           </p>
         </div>
       </Panel>

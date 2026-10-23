@@ -1035,6 +1035,16 @@ td.wrap {
   font-size: 13.5px;
   margin: 8px 0 20px;
 }
+.entry-card .note,
+.entry-card .alert {
+  margin: 0 0 16px;
+}
+.entry-card progress {
+  display: block;
+  width: 100%;
+  margin-bottom: 12px;
+  accent-color: var(--accent);
+}
 .entry-alt {
   margin-top: 20px;
   padding-top: 16px;

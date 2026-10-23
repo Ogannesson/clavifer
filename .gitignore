@@ -12,6 +12,7 @@ work/
 coverage/
 *.agekey
 *.age
+!tests/fixtures/**/*.age
 *.local.json
 *.token
 *.secret

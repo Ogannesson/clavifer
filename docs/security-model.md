@@ -6,11 +6,11 @@ Clavifer has had no third-party security audit.
 
 ## What it protects
 
-- **Stored secret values.** Values are encrypted before they reach the database. The key that decrypts them is a Worker secret and is not in the database. A copy of the database alone does not reveal a value.
+- **Stored secret values.** Values are encrypted before they reach the database. The key that decrypts them is derived from a Worker secret and is not in the database. A copy of the database alone does not reveal a value.
 - **Credentials used through connections.** An installation that calls a connection never receives the credential. The server injects it into the outgoing request, removes any `Authorization` or `Cookie` header the caller sent, and returns only five response headers from the upstream.
 - **Where a credential can go.** A connection sends its credential to its own fixed origin. It reaches another origin only when the Owner listed that hostname or turned on any host, and then only for one request the Owner approved.
 - **What each installation can do.** An installation can use only what the Owner granted or approved. Revoking a grant or an installation takes effect on its next request.
-- **Sensitive Owner operations.** Granting access, approving requests, editing connections, exporting, restoring, and changing the backup recipient need a sign-in within the last 10 minutes, so an older stolen session cannot perform them.
+- **Sensitive Owner operations.** Granting access, approving requests, editing connections, downloading a full export, and changing the backup recipient need a sign-in within the last 10 minutes, so an older stolen session cannot perform them.
 
 ## What it does not protect
 
@@ -46,7 +46,7 @@ Source: `cmd/clavifer/main.go` (`cmdRun`, `withWaitCommand`). Tests: `cmd/clavif
 
 ### Cloudflare is trusted
 
-Clavifer runs on Cloudflare Workers with a D1 database and an R2 bucket. The Worker decrypts secrets in memory to inject them. The key ring is a Worker secret. TLS ends at Cloudflare. The design assumes the platform and the account that deploys to it are trustworthy.
+Clavifer runs on Cloudflare Workers with a D1 database and an R2 bucket. The Worker decrypts secrets in memory to inject them. The root key is a Worker secret. TLS ends at Cloudflare. The design assumes the platform and the account that deploys to it are trustworthy.
 
 ### The upstream must be trusted
 
@@ -65,64 +65,68 @@ A secret is a set of named fields. Each saved version of a secret is encrypted a
 | Cipher             | AES-256-GCM through the Web Crypto API, with its default 128-bit tag |
 | Nonce              | 12 random bytes, new for every encryption                            |
 | Data key           | 32 random bytes, new for every version of every secret               |
-| Key-encryption key | 32 bytes, taken from `KEK_RING`                                      |
+| Key-encryption key | 32 bytes, derived from the current root key with HKDF-SHA256          |
 
 Encryption of one version:
 
 1. The server generates a data key.
-2. It encrypts the JSON object of field names and values with the data key. The additional authenticated data is the JSON array `["agent-credentials", 1, ownerId, secretId, version]`.
-3. It encrypts the data key with the active key-encryption key. The additional authenticated data is `dek:`, the same JSON array, `:`, and the key's ID.
-4. It stores `{"format": 1, "kekId", "wrappedDek", "ciphertext"}`. Each encrypted part is `base64url(nonce).base64url(ciphertext and tag)`.
+2. It encrypts the JSON object of field names and values with the data key. The additional authenticated data is the JSON array `["clavifer", 1, ownerId, secretId, version]`.
+3. It encrypts the data key with the key-encryption key. The additional authenticated data is `dek:`, the same JSON array, `:`, and the root key's ID.
+4. It stores `{"format": 1, "kekId", "wrappedDek", "ciphertext"}`, where `kekId` is the root key's ID. Each encrypted part is `base64url(nonce).base64url(ciphertext and tag)`.
 
 The additional authenticated data binds an envelope to its owner, secret, and version. An envelope copied onto another secret or another version does not decrypt.
 
-The `agent-credentials` prefix is the project's former name. It is part of every stored envelope and never changes.
-
-Keys:
-
-- `KEK_RING` is a comma-separated list of `id:key` pairs, each key 32 bytes in base64url. `ACTIVE_KEK_ID` names the key that encrypts new envelopes. Decryption uses the key the envelope names, so a key must stay in the ring as long as any envelope uses it.
-- Both are Worker secrets. They cannot be read back after they are set. Without `KEK_RING` no stored secret can be decrypted, so keep a copy somewhere safe before the first deployment, as [deploy.md](deploy.md#step-210-save-the-secrets-before-deploying) describes.
-- Updating a secret writes a new version with a new data key under the active key. Earlier versions stay in the database, encrypted, until the secret is deleted.
+Updating a secret writes a new version with a new data key under the current root key. Earlier versions stay in the database, encrypted, until the secret is deleted.
 
 What is and is not encrypted:
 
-| Stored encrypted                               | Stored in the clear                                                               |
-| ---------------------------------------------- | --------------------------------------------------------------------------------- |
-| Field names and values of every secret version | Secret names and descriptions                                                     |
-|                                                | Connections: origin, policy, description, and which secret and fields they inject |
-|                                                | Grants, access requests with their full content, and the audit log                |
+| Stored encrypted                                                                | Stored in the clear                                                               |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Field names and values of every secret version                                  | Secret names and descriptions                                                     |
+| The archive identity, in an envelope of the same kind                           | Connections: origin, policy, description, and which secret and fields they inject |
+| Sealed [segments](#cold-data) of old audit rows and access requests, in R2       | Grants, access requests with their full content, and the audit log                |
 
 A pending or decided access request keeps the request an agent submitted, including the headers and body of an invocation. Do not put a secret into a request submitted for approval.
 
 Deleting a secret removes the ciphertext of all its versions in the same database batch. A secret that a connection still uses cannot be deleted (`secret_in_use`).
 
-Source: `packages/core/crypto.ts`; `parseKeys()` in `apps/worker/src/context.ts`; the secret routes in `apps/worker/src/index.ts`. Tests: `tests/core.test.ts`, `tests/secrets.test.ts`.
+### The root key
+
+The service has one secret of its own, the Worker secret `ROOT_KEY`. It is a comma-separated ring of `<id>:<key>` entries, each key 32 bytes in base64url, the current key first; `parseRootKeys()` accepts nothing else. HKDF-SHA256 derives three keys from each root key, each for one use: the key-encryption key, the auth library's secret, and a fingerprint. The deploy entry `npm run deploy` generates the root key and hands it to wrangler without writing or printing it. A Worker secret cannot be read back once it is set.
+
+Self-check. Creating the Owner, or completing an import, records the fingerprint of every key in the ring in the database. A Worker whose ring does not match them, because the key was replaced or the Worker is bound to another instance's database, answers `503 root_key_mismatch` on every route except `/healthz` and skips its scheduled work. It never writes data under a key the database does not know. On an initialized instance, a `ROOT_KEY` that cannot be parsed makes every route answer `503 invalid_root_key`, `/healthz` included. `/healthz` reports the state in `keys` and `initialized`, and `clavifer doctor` explains each state.
+
+Outside the Worker (and `.dev.vars` for a local trial), no copy of the root key exists, by design: nobody is asked to keep one, so there is none to leak. The cost is that a lost or overwritten key makes every stored secret undecryptable. Recovery goes through the automatic backup instead. `npm run deploy -- --rebuild` gives the Worker a new key and a new, empty database, and refuses unless `/healthz` reports the key lost or every database the Worker is bound to was deleted. The latest automatic backup is then [imported](#backups) into the new database; changes made after that backup are lost. Creating the Owner therefore requires a backup recipient, and the Owner keeps the matching age private key outside the service. [deploy.md](deploy.md) has the steps.
+
+Source: `packages/core/crypto.ts`; `rootKeys()` and `keyState()` in `apps/worker/src/context.ts`; the secret routes in `apps/worker/src/index.ts`; `scripts/deploy.mjs`. Tests: `tests/core.test.ts`, `tests/secrets.test.ts`, `tests/root-key-check.test.ts`, `tests/deploy.test.ts`.
 
 ## Backups
 
-A backup is one file encrypted with [age](https://age-encryption.org) to a recipient, which is an age public key the Owner supplies. The server never holds the matching private key.
+The automatic backup and the full export are the same snapshot of the instance. A snapshot is a file in the format `clavifer-backup-v1`, one JSON record per line, encrypted with [age](https://age-encryption.org) to a recipient, which is an age public key the Owner supplies. The server never holds the matching private key. The format is frozen: every later version reads it. The header comment of `packages/core/snapshot.ts` specifies it.
 
 Contents:
 
-| In a backup                                          | Not in a backup                                           |
-| ---------------------------------------------------- | --------------------------------------------------------- |
-| The current version of every secret, with its values | Earlier versions of secrets                               |
-| Every connection with its policy and description     | The Owner account, sessions, and Passkeys                 |
-|                                                      | Installations, grants, access requests, and the audit log |
+| In a snapshot                                                      | Not in a snapshot                                      |
+| ------------------------------------------------------------------ | ------------------------------------------------------ |
+| The Owner: name, email address, password hash, and Passkeys        | Sessions, access and refresh tokens, and device codes   |
+| Every secret, and every version of an active one, with its values  | The keys that sign access tokens                        |
+| Connections, installations with their client IDs, and grants       | OAuth consents and rate limit counters                  |
+| Access requests and the audit log, sealed segments included        | The bootstrap token                                     |
+| The backup recipient and the archive identity                      | Backup bookkeeping other than the recipient             |
 
-The snapshot inside the file is JSON with the format identifier `agent-credentials-backup-v1`. The identifier keeps the project's former name and never changes. A snapshot holds at most 500 secrets and 500 connections and at most 8 MiB.
+A snapshot is taken from one consistent read of the database and checked against the format and for the references an import needs. If the instance is inconsistent, the snapshot is refused whole and the console shows why; the last good backup stays.
 
 Three operations:
 
-- **Manual export.** The Owner gives a recipient and downloads the encrypted file. The Worker decrypts the current secret values, builds the snapshot, and encrypts it to the recipient.
-- **Automatic backup.** Once the Owner has set a recipient, a scheduled run every 15 minutes writes a new encrypted file to the R2 bucket when a secret or connection changed, when the recipient changed, or when the last successful backup is 24 hours old. The server keeps the newest file of each day for 30 days and the newest file of each month for the 12 months before that, and deletes the rest. It never deletes the latest backup. A failed cleanup is reported separately and does not mark the backup as failed.
-- **Restore.** The Owner's browser decrypts the file locally with the age private key and sends the snapshot to the server over HTTPS. The private key is not sent. The server accepts a restore only when no secret, connection, or installation has ever been created in the deployment (`restore_requires_empty_vault`), and encrypts every value again under the active key. Grants are not restored and must be issued again.
+- **Automatic backup.** Once the Owner has set a recipient, a scheduled run every 15 minutes writes a new file to the R2 bucket when the data a snapshot carries changed, when the recipient changed, or when the last successful backup is 24 hours old. Sign-ins and the service's own audit rows do not count as changes. It names each [sealed segment](#cold-data) by its key in the same bucket instead of copying it. The server keeps the newest file of each day for 30 days and the newest file of each month for the 12 months before that, and deletes the rest. It never deletes the latest backup. A failed cleanup is reported separately and does not mark the backup as failed. While the data outside sealed segments takes more than about 9 MB, the backup is skipped (`hot_data_over_limit`); the console warns before that.
+- **Full export.** The Owner gives a recipient and downloads the whole instance, with every sealed segment embedded. `GET /admin/backup/export` runs only when the browser reports `Sec-Fetch-Site: same-origin`, because the recipient is part of the link. A segment missing from the bucket, or without the checksum recorded when it was sealed, refuses the export before the first byte (`archive_segment_unavailable`). A download that breaks off can still end cleanly in the browser, so an export counts as whole only after the server wrote a `backup:export` audit row with the result `complete`. The console checks this with `GET /admin/backup/exports/{id}`.
+- **Import.** On the `/setup` page, an uninitialized instance can be initialized from a snapshot instead of creating a new Owner. This serves a migration to a new instance and a recovery after a lost root key alike. The Owner's browser decrypts the file locally with the age private key and sends the records over HTTPS in chunks; the private key is not sent. The server encrypts every secret version again under its own root key. Everything in the snapshot comes across, and installations keep their client IDs. Passkeys come across only when the new instance has the hostname of the old one. No token travels, so every installation logs in again. A segment that an automatic backup names must already be in the new instance's bucket with its checksum; the Owner can choose to go on without a missing one, and the import's audit row lists those skipped. The import checks structure and references only. The instance stays uninitialized, and nobody can sign in, until a final batch completes it.
 
-Export, restore, and changing the recipient need a recent sign-in. Changing the recipient decides who can read all future backups.
+The full export and changing the recipient need a recent sign-in. Changing the recipient decides who can read all future backups.
 
 The R2 bucket belongs to the same Cloudflare account as the Worker. Automatic backups are not an independent copy. Copy them elsewhere yourself.
 
-Source: `apps/worker/src/backup.ts`; the restore form in `apps/web/src/pages/backup.tsx`. Tests: `tests/automatic-backup.test.ts`, `tests/backup-bindings.test.ts`.
+Source: `snapshot()` and `fullExport()` in `apps/worker/src/export.ts`; `apps/worker/src/backup.ts`; `apps/worker/src/import.ts`; `packages/core/snapshot.ts`; the importer in `apps/web/src/import.ts`. Tests: `tests/automatic-backup.test.ts`, `tests/full-export.test.ts`, `tests/import.test.ts`, `tests/snapshot.test.ts`, with the frozen samples in `tests/fixtures/v1/`.
 
 ## Audit log
 
@@ -138,8 +142,11 @@ The server writes a row to the `audit_events` table for each of the events below
 | `secret:create`, `secret:rotate`, `secret:delete`                       | The Owner creates, updates, or deletes a secret                              | `ok`                                                 |
 | `connection:save`, `connection:delete`                                  | The Owner creates, edits, or deletes a connection, also by approving a draft | `ok`                                                 |
 | `client:create`, `client:revoke`                                        | An installation is created or revoked                                        | `ok`                                                 |
-| `backup:export`, `backup:restore`, `backup:configure`, `backup:disable` | The Owner uses the backup functions                                          | `authorized` or `ok`                                 |
+| `backup:export`                                                         | A full export starts, and again after its last byte; the resource is the export's ID | `started`, then `complete`; or an error code |
+| `backup:configure`, `backup:disable`                                    | The Owner sets or clears the backup recipient                                | `ok`                                                 |
 | `backup:automatic`                                                      | An automatic backup run saves a file or fails                                | `ok` or an error code                                |
+| `archive:seal`                                                          | A segment is sealed, or sealing fails; the resource is the segment's key     | `ok` or an error code                                |
+| `owner:create`, `owner:recover`, `instance:import`                      | On `/setup`: the Owner is created, its password is reset, or an import completes | `ok`                                             |
 
 Not recorded:
 
@@ -149,11 +156,23 @@ Not recorded:
 - Owner sign-ins and device code approvals.
 - Any secret value.
 
-The web console shows the latest 50 rows. The server never deletes audit rows. The table is an ordinary table in the same database, so it is not tamper-proof against someone with database access.
+The web console shows the latest 50 rows. The server never deletes audit rows; old ones move to sealed segments, as the next section describes. The table is an ordinary table in the same database, and the segments are files in the same account's bucket, so neither is tamper-proof against someone with access to the account.
 
 When a request fails with an internal error, the Worker logs the error code and the request ID and nothing else.
 
-Source: `audit()` in `apps/worker/src/context.ts` and its callers in `apps/worker/src/index.ts`, `vault.ts`, and `backup.ts`. Tests: `tests/policy.test.ts`, `tests/proposals.test.ts`.
+Source: `audit()` in `apps/worker/src/context.ts` and its callers in `apps/worker/src/index.ts`, `vault.ts`, `backup.ts`, `export.ts`, `archive.ts`, `setup.ts`, and `import.ts`. Tests: `tests/policy.test.ts`, `tests/proposals.test.ts`.
+
+### Cold data
+
+Audit rows and access requests leave the database in sealed segments and are never deleted:
+
+- An audit row can be sealed once it is 5 minutes old, and an access request once it is 25 hours old. By then nothing changes either of them any more.
+- On every scheduled run, before the automatic backup, the server seals the oldest of these rows, about 1 MB per segment, while they take more than about 1.5 MB. The most recent history therefore stays in the tables for the console.
+- A segment is an immutable file under `archive/` in the R2 bucket, encrypted with age to the archive identity. Nothing under `archive/` is ever overwritten or deleted.
+- The archive identity is a hybrid post-quantum age identity created with the Owner. The database holds it encrypted under the root key, and every snapshot carries it, so whoever can decrypt a snapshot can also read its segments. The segments are therefore protected no better than the backup recipient. The key pair the console generates for backups is X25519, which is not post-quantum; for post-quantum protection, use an `age1pq1…` recipient. The service itself never reads a segment again.
+- An archived access request is gone from `access.status`, which answers `request_not_found`.
+
+Source: `apps/worker/src/archive.ts`. Tests: `tests/archive.test.ts`.
 
 ## Response headers
 
@@ -228,7 +247,7 @@ For a request to another origin that only any host covers, the console also asks
 - Approval writes the secret, all connections, and the request's status in one batch. If one write fails, none takes effect.
 - An update is applied only if the connection is unchanged since submission (`connection_changed`).
 
-One installation can hold at most 20 pending requests, which bounds what the Owner has to read.
+One request takes at most 256 KiB as stored, and one installation can hold at most 20 pending requests and 1 MiB of them, which bounds what the Owner has to read.
 
 Source: `requestFingerprint()`, `consumeApproval()`, `accessRequest()`, and `decide()` in `apps/worker/src/vault.ts`; `decideRequest()` and the approval route in `apps/worker/src/index.ts`; `canonicalPath()` in `packages/core/proxy.ts`; the review cards in `apps/web/src/pages/access.tsx`. Tests: `tests/policy.test.ts`, `tests/proposals.test.ts`.
 
@@ -245,10 +264,11 @@ These are properties of the design or gaps the project has not closed. They are 
 - **No third-party security audit.**
 - **Profiles are not isolation.** Programs running as the same operating system user can use each other's stored logins.
 - **No DNS pinning.** A connection's hostname is checked by name only.
-- **No key rotation procedure.** The code reads a ring of keys and encrypts new versions with the active one, but no command adds a key or re-encrypts existing envelopes, and changing the ring on a deployment that holds data is untested. See [deploy.md](deploy.md#server-keys).
-- **Backups stay in the same Cloudflare account** unless you copy them out.
+- **No key rotation procedure.** `ROOT_KEY` is read as a ring and every envelope names the key that wrapped it, but no command adds a key, and the self-check refuses a current key that was not recorded at initialization. The way to a new key is a full export imported into a new instance.
+- **No copy of the root key.** A lost key loses the changes made since the last automatic backup. See [The root key](#the-root-key).
+- **Backups stay in the same Cloudflare account** unless you copy them out. So do the sealed segments.
 - **The audit log does not record request contents** and is not tamper-proof.
-- **No account recovery in the console.** There is no email reset.
+- **No account recovery by email.** Recovering a lost password and Passkeys takes a token that only the deployment can issue.
 - **Revocation cannot recall a request** that was already sent to an upstream.
 - **The REST proxy does not limit response size.** It streams until the upstream ends or 20 seconds pass.
 

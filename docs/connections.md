@@ -195,7 +195,7 @@ Errors from sending a request:
 | `response_too_large`                                                                                                            | 413                     | MCP only. The response exceeded 1 MiB. The upstream request already ran.                                                                                   | Do not resend a write. Paginate or narrow the query.                                                                                                         |
 | `upstream_outcome_unknown`                                                                                                      | 502                     | The request to the upstream failed before a response arrived, by timeout or network error. The request may have run. A one-time approval it used is spent. | Read the upstream state first. Never retry a write automatically.                                                                                            |
 | `secret_not_found`, `secret_field_not_found`, `invalid_header_credential`, `invalid_basic_credential`, `encryption_key_missing` | 404, 404, 400, 400, 503 | The connection's credential binding is broken or the server cannot decrypt.                                                                                | Tell the user. Only the Owner can repair it.                                                                                                                 |
-| `invalid_arguments` (MCP), `invalid_input` (REST)                                                                               | 400                     | The input does not match the schema. The hint names each offending field.                                                                                  | Fix the named field.                                                                                                                                         |
+| `invalid_arguments` (MCP), `invalid_input` (REST)                                                                               | 400                     | The input does not match the schema. The hint names up to five offending fields.                                                                           | Fix the named fields.                                                                                                                                        |
 
 Errors from `access.request` and `access.status`:
 
@@ -206,11 +206,12 @@ Errors from `access.request` and `access.status`:
 | `connection_not_found`, `secret_not_found`                                   | 404    | A grant, invocation, or update names a resource that does not exist.                              | Check `credentials.list`, or ask the user which resource the task needs.  |
 | `body_too_large`                                                             | 413    | The invocation body exceeds 64 KiB.                                                               | Split the work, or upload large files with the agent host's own tools.    |
 | `headers_too_large`                                                          | 413    | The invocation headers exceed 16 KiB in total.                                                    | Send only the headers the upstream needs.                                 |
-| `too_many_pending`                                                           | 429    | This installation already has 20 requests waiting for the Owner.                                  | Tell the user and wait. Do not submit again until the Owner decides some. |
+| `request_too_large`                                                          | 413    | The request takes more than 256 KiB as stored, counted on its JSON after escaping.                | Split the draft into smaller requests, or trim its tests, descriptions, and body. |
+| `too_many_pending`                                                           | 429    | This installation already has 20 requests, or 1 MiB of requests as stored, waiting for the Owner. | Tell the user and wait. Do not submit again until the Owner decides some. |
 | `tests_failed`                                                               | 400    | A draft's tests do not match its policy. The hint lists each mismatch.                            | Fix the draft or the expectation and submit again.                        |
 | `name_taken`                                                                 | 409    | A draft uses a connection name that exists or existed.                                            | Choose another name.                                                      |
 | `invalid_rule`, `too_many_rules`, `invalid_host`, `use_path_prefix_not_glob` | 400    | A draft or a scope extension is malformed. The hint names the connection, the list, and the line. | Fix that line.                                                            |
-| `request_not_found`                                                          | 404    | This installation has no access request with this ID.                                             | Use the ID `access.request` returned.                                     |
+| `request_not_found`                                                          | 404    | This installation has no access request with this ID, or the request is more than about 25 hours old and was archived. | Use the ID `access.request` returned. To ask again, call `access.request`. |
 
 Errors only the Owner sees, when approving a request:
 
@@ -240,11 +241,12 @@ Rules common to all four:
 - `reason` holds up to 500 characters and is what the Owner reads first. Name the target the way a person knows it (name, account, creation date) and the expected effect. When acting on an opaque ID, say how you identified it.
 - A request stays `pending` for 24 hours. After that its status is `expired`.
 - Submitting the same `requested` content again while the first request is pending returns the first request's ID.
-- One installation holds at most 20 pending requests (`too_many_pending`). Expired ones do not count.
+- One request takes at most 256 KiB as stored, counted on its JSON after escaping (`request_too_large`).
+- One installation holds at most 20 pending requests and 1 MiB of them as stored (`too_many_pending`). Expired ones do not count.
 - Revoking an installation denies its pending requests.
 - The Owner needs a recent sign-in to approve. Denying does not need one.
 
-`access.status` reports `pending`, `approved`, `denied`, `expired`, or `executed`. `executed` means an approved one-time approval has been spent.
+`access.status` reports `pending`, `approved`, `denied`, `expired`, or `executed`. `executed` means an approved one-time approval has been spent. A request more than about 25 hours old may have been moved to the [archive](security-model.md#cold-data); `access.status` then answers `request_not_found`.
 
 ### Grants
 

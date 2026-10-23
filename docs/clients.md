@@ -54,7 +54,7 @@ Steps 1, 2 and 7 are not performed again: every environment uses the same execut
 
 Who: Agent
 
-Building needs Go. `go.mod` names the toolchain `go1.26.9`. Inside this repository, `go version` always reports that toolchain, not the version installed on the machine: when the installed Go is older, Go downloads the named toolchain on first use, which needs network access, and prints a line such as `go: downloading go1.26.9`. Nobody has to upgrade Go by hand.
+Building needs Go. `go.mod` names the toolchain `go1.26.10`. Inside this repository, `go version` always reports that toolchain, not the version installed on the machine: when the installed Go is older, Go downloads the named toolchain on first use, which needs network access, and prints a line such as `go: downloading go1.26.10`. Nobody has to upgrade Go by hand.
 
 Run `go version` from the repository root and decide by the result:
 
@@ -391,5 +391,7 @@ The console can also create an installation for an MCP client that connects to t
 - `refreshed login could not be saved to the system credential store; run login again`: the service has already issued a new token, and the stored one is no longer valid. Perform Step 4.
 - `system credential store unavailable`: the credential store cannot be opened. Unlock it and repeat the command; logging in again does not help.
 - `doctor` reports `Login expired or installation revoked`: the Owner checks the installation on the 安装实例 (installations) page. A revoked installation cannot be restored; perform Steps 3 and 4.
+- `doctor` fails the `server` check with a message about the service's root key or a missing Owner: the service itself is not ready, and logging in again does not help. Pass the message to the person who operates the deployment. It names what they must do: restore the original `ROOT_KEY` or rebuild the instance from a backup, fix a `ROOT_KEY` that cannot be parsed, or create the Owner on the `/setup` page.
 - After the hostname of the service has changed, every profile must log in again with the new address (Step 4). The client ID stays the same.
+- After the deployment was moved to a new instance by importing a snapshot, every profile must log in again (Step 4), with the same client ID. Installations and grants come across in a snapshot; logins do not.
 - An error from `http.request` or `access.request`, such as `grant_required` or `path_denied`: it carries a `hint` that names the next action. [connections.md](connections.md) lists these codes.

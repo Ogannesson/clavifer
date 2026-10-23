@@ -11,3 +11,5 @@
 *.ps1 text eol=lf
 *.css text eol=lf
 *.mts text eol=lf
+*.age binary
+tests/fixtures/** -text

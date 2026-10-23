@@ -171,6 +171,37 @@ func TestDoctorRejectsUntrustedHealthBeforeAuthentication(t *testing.T) {
 	}
 }
 
+func TestDoctorExplainsUnhealthyService(t *testing.T) {
+	fakeStore(t, tokenResponse{AccessToken: "synthetic", ExpiresAt: time.Now().Unix() + 600})
+	for _, c := range []struct{ status, body, detail string }{
+		{"200", `{"ok":false,"service":"clavifer","version":"0.5.0","keys":"mismatch","initialized":true}`, "does not match its database"},
+		{"200", `{"ok":true,"service":"clavifer","version":"0.5.0","keys":"uninitialized","initialized":false}`, "no Owner yet"},
+		{"503", `{"error":"invalid_root_key"}`, "cannot be parsed"},
+		{"200", `{"ok":false,"service":"clavifer","version":"0.5.0","keys":"ok","initialized":true}`, "valid Clavifer health response"},
+	} {
+		var authenticated atomic.Bool
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/healthz" {
+				authenticated.Store(true)
+			}
+			w.Header().Set("content-type", "application/json")
+			if c.status == "503" {
+				w.WriteHeader(503)
+			}
+			fmt.Fprint(w, c.body)
+		}))
+		if err := save(profile{s.URL, "unhealthy"}); err != nil {
+			t.Fatal(err)
+		}
+		report := diagnose(context.Background(), false)
+		s.Close()
+		last := report.Checks[len(report.Checks)-1]
+		if report.OK || authenticated.Load() || last.Name != "server" || !strings.Contains(last.Detail, c.detail) {
+			t.Fatalf("health %s was not diagnosed: %+v", c.body, last)
+		}
+	}
+}
+
 func TestDoctorRevokedSessionAndCredentialStoreFailure(t *testing.T) {
 	fakeStore(t, tokenResponse{AccessToken: "synthetic", ExpiresAt: time.Now().Unix() + 600})
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

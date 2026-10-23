@@ -14,7 +14,7 @@ The layout of the repository and the project's conventions are in [AGENTS.md](AG
 
 ## Checks before a pull request
 
-These are the checks CI runs on Linux and Windows. Run them locally before you open a pull request.
+These are the checks CI runs on Linux and Windows, the gates that [AGENTS.md](AGENTS.md#gates-all-must-pass-after-a-change) lists. All of them must pass. Run them locally before you open a pull request.
 
 | Command                            | What it checks                                                                                                     | Where it runs  |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------ | -------------- |
@@ -24,14 +24,13 @@ These are the checks CI runs on Linux and Windows. Run them locally before you o
 | `npm run openapi:check`            | The committed `packages/contracts/openapi.json` matches the generated one                                          | Linux, Windows |
 | `gofmt -l cmd/`                    | Go formatting; must print nothing                                                                                  | Linux, Windows |
 | `go vet ./...` and `go test ./...` | The command line client                                                                                            | Linux, Windows |
-| `npm run test:e2e`                 | End-to-end tests against an isolated local database, with the command line client; no external services            | Linux, Windows |
+| `npm run test:e2e`                 | End-to-end tests against isolated local databases, with the command line client, including recovery from an automatic backup after a lost root key and a move to another origin by full export and import; no external services | Linux, Windows |
 | `npm run test:system`              | The command line client against the real Windows Credential Manager. It writes synthetic entries and removes them. | Windows only   |
 
 A few scripts are run by hand and are not part of CI:
 
 - `scripts/build-cli-matrix.ps1` cross-compiles the command line client for Windows, Linux and macOS on amd64 and arm64. Nothing else checks that the macOS and arm64 builds compile.
 - `scripts/test-installer.ps1` tests `integrations/adapters/install-skill.ps1` in a sandbox directory. It needs PowerShell 7.
-- `scripts/e2e-backup.mjs` and `scripts/e2e-origin-change.mjs` are acceptance runs against a local database, for backups and for a deployment whose `APP_ORIGIN` changes. Run `npm run build` first.
 
 One more check is not part of CI:
 
@@ -47,9 +46,10 @@ Tests use synthetic credentials only. Never put a real credential, token, or the
 
 - **Migrations only grow.** Add a new numbered file in `migrations/`. Never edit a migration that has been released.
 - **Change the documentation with the behavior.** When a change alters what a sentence in `README.md` or `docs/` says, correct that sentence in the same pull request. Do not add a long new document for it. The same goes for what agents read: the tool descriptions and server instructions in `apps/worker/src/mcp.ts`, and the Skill in `integrations/skills/clavifer/`.
+- **Change both READMEs together.** `README.md` is the source, and `README.zh-CN.md` has the same sections and facts. Change both in the same commit.
 - **Regenerate the contract.** After changing a route or a request schema, run `npm run openapi:generate` and commit the result.
 - **Keep decisions on the server.** Grants decide what an installation may do; OAuth scopes do not. The decision for a connection request stays in `decide()` and `invoke()` in `apps/worker/src/vault.ts`, so that real requests and draft tests share it.
-- **Two stored identifiers never change.** The additional authenticated data of every encrypted secret starts with `agent-credentials` (`packages/core/crypto.ts`), and the backup format identifier is `agent-credentials-backup-v1` (`apps/worker/src/backup.ts`). Both carry the project's former name. Renaming either would make existing data unreadable.
+- **Stored formats never change meaning.** The additional authenticated data of an encrypted secret and of the archive identity (`packages/core/crypto.ts`) is written into stored data; changing it makes the stored ciphertext undecryptable, so a replacement is a new version that keeps the old one readable. The snapshot format `clavifer-backup-v1` is specified by the header comment of `packages/core/snapshot.ts` and is frozen: a change is a v2 with a conversion from v1. The samples in `tests/fixtures/v1/` are never modified once released; see [their README](tests/fixtures/v1/README.md).
 
 Three rules for engineering trade-offs:
 

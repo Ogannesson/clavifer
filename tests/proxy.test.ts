@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { encryptSecret } from '../packages/core/crypto';
+import { encryptSecret, parseRootKeys } from '../packages/core/crypto';
 import { appendQuery, credentialHeaderName, upstreamHeaders } from '../packages/core/proxy';
 import { authInput, invoke, invokeInput, parseProxyRequest, validateAuthBinding } from '../apps/worker/src/vault';
 import { type Bindings, type Principal, boundedBytes } from '../apps/worker/src/context';
@@ -18,11 +18,15 @@ afterEach(() => vi.unstubAllGlobals());
 // Exercise the actual vault, envelope decryption, grant gate, and network
 // boundary while keeping the test independent from D1 and external services.
 async function fixture(auth: ReturnType<typeof authInput.parse>, values: Record<string, string> = {}, allowed = true) {
-  const key = Buffer.from('p'.repeat(32)).toString('base64url');
-  const envelope = await encryptSecret({ v1: key }, 'v1', { ownerId: 'owner', secretId: 'secret', version: 1 }, values);
+  const rootKey = `1:${Buffer.from('p'.repeat(32)).toString('base64url')}`;
+  const envelope = await encryptSecret(
+    parseRootKeys(rootKey),
+    { ownerId: 'owner', secretId: 'secret', version: 1 },
+    values,
+  );
   const events: string[] = [];
   const env = {
-    KEK_RING: `v1:${key}`,
+    ROOT_KEY: rootKey,
     ALLOW_LOCAL_HTTP: 'false',
     DB: {
       prepare(sql: string) {

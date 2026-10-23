@@ -2,7 +2,7 @@ module github.com/Ogannesson/clavifer
 
 go 1.26
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require github.com/zalando/go-keyring v0.2.6
 

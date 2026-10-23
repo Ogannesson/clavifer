@@ -1,9 +1,47 @@
 import { useState } from 'react';
-import { api, downloadExport, fault, fv, relativeText, timeText } from '../api';
-import { PageHead, RefreshButton, type AppApi } from '../shell';
+import {
+  api,
+  archiveErrorMessage,
+  fault,
+  fv,
+  relativeText,
+  startFullExport,
+  timeText,
+  type ExportStatus,
+} from '../api';
+import { PageHead, RefreshButton, auth, type AppApi } from '../shell';
 import { Badge, Drawer, Field, Icon, Loading, Panel, useConfirm } from '../ui';
 
-type Sheet = 'recipient' | 'export' | 'restore' | null;
+type Sheet = 'recipient' | 'full' | null;
+type FullExport = {
+  id: string;
+  at: number;
+  state: 'running' | 'complete' | 'failed' | 'unconfirmed';
+  error?: string;
+};
+type Outcome = Pick<FullExport, 'state' | 'error'>;
+// The data sealing never moves out stops every automatic backup on its own once it passes 9 MB; the page
+// warns from 6 MB on, while there is still room to act.
+const UNSEALED_WARNING = 6_000_000;
+const unconfirmedText =
+  '还没有收到服务端写完的确认，这份完整导出可能不完整，不要依赖它。很大的导出可能稍后才写完，可以再次检查；否则请删除已下载的文件，重新导出。';
+
+/** Whether the server has recorded the full export with this id as written whole or as refused. */
+async function exportOutcome(id: string): Promise<Outcome | null> {
+  const { status, error } = (await api(`/admin/backup/exports/${id}`)) as ExportStatus;
+  return status === 'complete' ? { state: 'complete' } : status === 'failed' ? { state: 'failed', error } : null;
+}
+/** Asks every 2 seconds, for up to 5 minutes. An export the CPU limit cut off records nothing more, so
+ * only the deadline can tell it apart from one still running. */
+async function watchExport(id: string): Promise<Outcome> {
+  for (const deadline = Date.now() + 300_000; Date.now() < deadline;) {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    // A status request that failed in passing says nothing about the export; the next one asks again.
+    const outcome = await exportOutcome(id).catch(() => null);
+    if (outcome) return outcome;
+  }
+  return { state: 'unconfirmed' };
+}
 
 /** /admin/backup/run answers 200 with an outcome, so a no-op must not be reported as a new copy. */
 export const runBackupNow = (app: AppApi) =>
@@ -18,8 +56,31 @@ export const runBackupNow = (app: AppApi) =>
 
 export function Backup({ app }: { app: AppApi }) {
   const [sheet, setSheet] = useState<Sheet>(null);
+  const [full, setFull] = useState<FullExport | null>(null);
   const confirm = useConfirm();
   const backup = app.status.backup;
+
+  const exportAll = (recipient: string) =>
+    app.run(async () => {
+      // A link download cannot sign in again on its own, so the 10-minute rule is checked here first,
+      // with a minute to spare; signing in again then runs this once more.
+      const session = (await auth.getSession()).data?.session;
+      if (!session || Date.now() - new Date(session.createdAt).getTime() > 540_000)
+        throw fault('recent_login_required');
+      const id = startFullExport(recipient);
+      const at = Date.now();
+      setSheet(null);
+      setFull({ id, at, state: 'running' });
+      void watchExport(id).then((outcome) => settle(id, at, outcome));
+    }, '完整导出已开始下载，服务端写完后此页会确认。');
+  const settle = (id: string, at: number, outcome: Outcome) => {
+    setFull({ id, at, ...outcome });
+    if (outcome.state === 'complete') app.notify('完整导出已全部写出。');
+    else app.notify(outcome.state === 'failed' ? fault(outcome.error ?? '').message : unconfirmedText, true);
+  };
+  // After the deadline the Owner can still ask once more, for an export that took longer.
+  const recheck = (f: FullExport) =>
+    app.run(async () => settle(f.id, f.at, (await exportOutcome(f.id)) ?? { state: 'unconfirmed' }), '');
 
   const disable = async () => {
     const ok = await confirm({
@@ -39,7 +100,7 @@ export function Backup({ app }: { app: AppApi }) {
     <>
       <PageHead
         title="备份"
-        description="服务端只保存加密文件和你的 age 公钥，私钥始终由你保管。R2 副本与服务位于同一账户，请定期下载到独立位置。"
+        description="服务端只保存加密文件和你的 age 公钥，私钥始终由你保管。自动备份与服务位于同一个 Cloudflare 账户，请定期下载完整导出，保存到账户之外。"
         actions={<RefreshButton app={app} />}
       />
       {app.loading || !backup ? (
@@ -48,6 +109,25 @@ export function Backup({ app }: { app: AppApi }) {
         </Panel>
       ) : (
         <>
+          {/* Until a backup succeeds again, a restore loses everything since the last one. */}
+          {backup.lastError ? (
+            <div className="alerts">
+              <div className="alert alert--danger">
+                <span className="alert-icon">
+                  <Icon name="alert" size={18} />
+                </span>
+                <div className="alert-body">
+                  <strong>
+                    {backup.lastError === 'hot_data_over_limit' ? '热数据超限，自动备份已跳过' : '自动备份没有保存'}
+                  </strong>
+                  <p>
+                    {fault(backup.lastError).message} 已保存的备份不受影响，但它之后的改动都还没有备份。上次成功：
+                    {backup.lastSuccessAt ? timeText(backup.lastSuccessAt) : '尚未成功过'}。
+                  </p>
+                </div>
+              </div>
+            </div>
+          ) : null}
           <Panel
             title="自动备份"
             description={`每 ${backup.scheduleMinutes} 分钟检查变更，无变更时每天保存一份。`}
@@ -81,12 +161,18 @@ export function Backup({ app }: { app: AppApi }) {
                     {backup.running ? (
                       <Badge tone="accent">正在备份</Badge>
                     ) : backup.pending ? (
-                      <Badge tone="warn">有改动待备份</Badge>
+                      <Badge>有改动待备份</Badge>
                     ) : backup.configured ? (
                       <Badge>已是最新</Badge>
                     ) : null}
-                    {backup.lastError ? <Badge tone="danger">最近一次失败</Badge> : null}
+                    {backup.lastError ? (
+                      <Badge tone="danger">
+                        {backup.lastError === 'hot_data_over_limit' ? '热数据超限' : '最近一次失败'}
+                      </Badge>
+                    ) : null}
                     {backup.retentionError ? <Badge tone="warn">旧副本清理失败</Badge> : null}
+                    {backup.archiveError ? <Badge tone="warn">冷数据封存失败</Badge> : null}
+                    {backup.unsealedBytes > UNSEALED_WARNING ? <Badge tone="warn">接近热数据上限</Badge> : null}
                   </div>
                   <p className="row-meta">
                     最近成功：
@@ -95,16 +181,30 @@ export function Backup({ app }: { app: AppApi }) {
                       : '尚未成功备份'}
                   </p>
                   <p className="row-meta">最近尝试：{timeText(backup.lastAttemptAt)}</p>
-                  {backup.lastError ? <p className="row-meta">失败原因：{fault(backup.lastError).message}</p> : null}
+                  {backup.downloadAvailable ? (
+                    <p className="row-meta">
+                      下载的自动备份需与所在的桶一起使用：已封存的旧审计和访问申请只按键引用桶里的文件，不在备份之内。
+                    </p>
+                  ) : null}
                   {backup.retentionError ? (
                     <p className="row-meta">最新副本已保存成功，只是旧副本没能删除，下一次成功备份会重试清理。</p>
+                  ) : null}
+                  {backup.archiveError ? (
+                    <p className="row-meta">封存失败原因：{archiveErrorMessage(backup.archiveError)}</p>
+                  ) : null}
+                  {backup.unsealedBytes > UNSEALED_WARNING ? (
+                    <p className="row-meta">
+                      凭据及其各版本、连接、安装实例、授权和管理员账户这些永不封存的数据已占{' '}
+                      {(backup.unsealedBytes / 1_000_000).toFixed(1)} MB。超过 9 MB
+                      后自动备份会一直跳过，只能靠完整导出；请删除不再使用的凭据和连接。
+                    </p>
                   ) : null}
                 </div>
                 <div className="row-actions">
                   {backup.downloadAvailable ? (
                     <a className="btn btn--ghost btn--small" href="/admin/backup/latest" download>
                       <Icon name="download" size={15} />
-                      下载最近副本
+                      下载最新的自动备份
                     </a>
                   ) : null}
                   {backup.configured ? (
@@ -134,30 +234,56 @@ export function Backup({ app }: { app: AppApi }) {
             </div>
           </Panel>
           <Panel
-            title="手动导出与恢复"
-            description="导出的内容是当前有效凭据与连接，不包含历史版本、登录令牌与授权。"
+            title="手动导出"
+            description="完整导出包含实例的全部状态和已封存的冷数据，单独一个文件即可重建实例。失去这个 Cloudflare 账户时，能救回数据的只有保存在账户之外的完整导出，请定期下载一份。"
             actions={
-              <>
-                <button type="button" className="btn btn--ghost" disabled={app.busy} onClick={() => setSheet('export')}>
-                  下载加密备份
-                </button>
-                <button
-                  type="button"
-                  className="btn btn--ghost"
-                  disabled={app.busy}
-                  onClick={() => setSheet('restore')}
-                >
-                  从备份恢复
-                </button>
-              </>
+              <button type="button" className="btn" disabled={app.busy} onClick={() => setSheet('full')}>
+                完整导出
+              </button>
             }
           >
-            <div className="panel-body">
-              <p className="note">
-                恢复只能在全新的空凭据库中进行：先初始化新 Owner，不创建任何实例、凭据或连接，再在此处选择 .age
-                文件和对应私钥。浏览器先解密，再通过同源连接写入新库并以新库密钥重新加密。恢复后需要重新登录、创建实例并重新授权。
-              </p>
-            </div>
+            {full ? (
+              <div className="rows">
+                <div className="row">
+                  <div className="row-main">
+                    <div className="row-title">
+                      <h3>完整导出</h3>
+                      {full.state === 'running' ? (
+                        <Badge tone="accent">正在导出</Badge>
+                      ) : full.state === 'complete' ? (
+                        <Badge tone="ok">已全部写出</Badge>
+                      ) : full.state === 'failed' ? (
+                        <Badge tone="danger">导出被拒绝</Badge>
+                      ) : (
+                        <Badge tone="danger">可能不完整</Badge>
+                      )}
+                    </div>
+                    <p className="row-meta">开始于 {timeText(full.at)}</p>
+                    <p className="row-meta">
+                      {full.state === 'running'
+                        ? '下载结束后，这里会显示服务端是否写完了最后一块。请不要关闭此页。'
+                        : full.state === 'complete'
+                          ? '服务端已写完最后一块。请把文件保存到 Cloudflare 账户之外的位置。'
+                          : full.state === 'failed'
+                            ? fault(full.error ?? '').message
+                            : unconfirmedText}
+                    </p>
+                  </div>
+                  {full.state === 'unconfirmed' ? (
+                    <div className="row-actions">
+                      <button
+                        type="button"
+                        className="btn btn--ghost btn--small"
+                        disabled={app.busy}
+                        onClick={() => void recheck(full)}
+                      >
+                        再次检查
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
           </Panel>
         </>
       )}
@@ -202,88 +328,34 @@ export function Backup({ app }: { app: AppApi }) {
       </Drawer>
 
       <Drawer
-        open={sheet === 'export'}
-        title="下载加密备份"
+        open={sheet === 'full'}
+        title="完整导出"
         description="需要 10 分钟内的登录。文件用你提供的 age 公钥加密，服务端不保留副本。"
         onClose={() => setSheet(null)}
       >
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            const f = new FormData(e.currentTarget);
-            void app.run(async () => {
-              await downloadExport(fv(f, 'recipient').trim());
-              setSheet(null);
-            }, '加密备份已开始下载。');
+            void exportAll(fv(new FormData(e.currentTarget), 'recipient').trim());
           }}
         >
-          <Field label="age 公钥收件人" hint="可以与自动备份使用同一个公钥，也可以另用一个。">
-            <input name="recipient" autoComplete="off" placeholder="age1…" required />
+          <Field label="age 公钥收件人" hint="默认是自动备份的公钥，也可以另用一个，包括以 age1pq1 开头的后量子公钥。">
+            <input
+              name="recipient"
+              autoComplete="off"
+              placeholder="age1…"
+              required
+              defaultValue={backup?.recipient ?? ''}
+            />
           </Field>
+          <p className="note">
+            完整导出包含 Owner 的登录信息与 Passkey、全部凭据及其历史版本、API
+            连接、安装实例、授权、访问申请和审计（含已封存的部分），单独一个文件即可重建整个实例，用于迁移和在
+            Cloudflare 之外保存。自动备份只按键引用桶里已封存的部分，离开所在的桶就不完整，不能代替它。
+          </p>
           <div className="form-actions">
             <button className="btn" disabled={app.busy}>
-              下载加密备份
-            </button>
-            <button type="button" className="btn btn--ghost" onClick={() => setSheet(null)}>
-              取消
-            </button>
-          </div>
-        </form>
-      </Drawer>
-
-      <Drawer
-        open={sheet === 'restore'}
-        title="从备份恢复"
-        description="需要 10 分钟内的登录，且目标必须是空凭据库。私钥只在当前浏览器中用于解密。"
-        onClose={() => setSheet(null)}
-      >
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            const f = new FormData(e.currentTarget);
-            void (async () => {
-              const file = f.get('file') as File;
-              if (file.size > 10 * 1024 * 1024) {
-                app.notify('备份超过 10 MiB 限制。', true);
-                return;
-              }
-              const ok = await confirm({
-                title: '恢复到当前凭据库',
-                body: '恢复会把备份中的凭据与连接写入这个库，登录、实例与授权不会一并恢复。只能在空库中进行。',
-                confirmLabel: '解密并恢复',
-                danger: true,
-              });
-              if (!ok) return;
-              await app.run(async () => {
-                // The decrypter is a separate chunk; failing to load it is a connection problem, not a bad key.
-                const { Decrypter } = await import('age-encryption').catch(() => {
-                  throw fault('network_error');
-                });
-                let snapshot: unknown;
-                // age reports a wrong key, a wrong file or a damaged file in English; all mean the same to the Owner.
-                try {
-                  const d = new Decrypter();
-                  d.addIdentity(fv(f, 'identity').trim());
-                  snapshot = JSON.parse(await d.decrypt(new Uint8Array(await file.arrayBuffer()), 'text'));
-                } catch {
-                  throw fault('backup_decrypt_failed');
-                }
-                await api('/admin/backup/restore', 'POST', snapshot);
-                setSheet(null);
-                await app.refresh();
-              }, '恢复完成，请重新创建实例并授权。');
-            })();
-          }}
-        >
-          <Field label="备份文件">
-            <input name="file" type="file" accept=".age" required />
-          </Field>
-          <Field label="age 私钥" hint="以 AGE-SECRET-KEY-1 开头，只在浏览器内使用。">
-            <input name="identity" type="password" autoComplete="off" required />
-          </Field>
-          <div className="form-actions">
-            <button className="btn btn--danger" disabled={app.busy}>
-              解密并恢复
+              开始导出
             </button>
             <button type="button" className="btn btn--ghost" onClick={() => setSheet(null)}>
               取消

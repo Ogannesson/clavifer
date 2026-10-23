@@ -16,7 +16,7 @@ import {
   METHODS,
   QUERY_TOO_LARGE,
 } from '../../../packages/core/proxy';
-import { type Bindings, type Principal, now, id, parseKeys, audit, boundedBytes } from './context';
+import { type Bindings, type Principal, now, id, rootKeys, audit, boundedBytes } from './context';
 
 // Messages on these schemas reach an Agent as the hint of invalid_arguments, naming what to fix.
 export const resourceId = z
@@ -116,7 +116,7 @@ function prefixPath(path: string) {
   );
   return checkPath(path);
 }
-/** Validates a saved or restored connection policy and returns it with each rule normalized. allowLocal
+/** Validates a connection policy being saved or proposed in a draft and returns it with each rule normalized. allowLocal
  * is the local deployment's exception for an extra host, the one targetUrl makes for an origin. */
 export function policyJson(c: Required<ConnectionPolicy>, allowLocal = false) {
   c.paths.forEach((path, i) => {
@@ -457,7 +457,7 @@ export async function boundSecret(env: Bindings, owner: string, sid: string) {
   return {
     version: row.current_version,
     values: await decryptSecret(
-      parseKeys(env),
+      rootKeys(env),
       { ownerId: owner, secretId: sid, version: row.current_version },
       JSON.parse(row.envelope_json),
     ),
@@ -549,6 +549,20 @@ export async function accessRequest(env: Bindings, p: Principal, input: unknown,
       ? await updateRequest(env, p.userId, update)
       : body.requested;
   const requested = JSON.stringify(stored);
+  // They are fixed on submission, so access.status can name them once the Owner approves.
+  const ids = setup && {
+    ...(setup.secret ? { secretId: id() } : {}),
+    connectionIds: setup.connections.map(() => id()),
+  };
+  const value = ids ? JSON.stringify({ ...stored, ids }) : requested;
+  // Counted as stored, after JSON escaping, which is what the database, the console and every snapshot hold.
+  const size = new TextEncoder().encode(value + body.reason).byteLength;
+  assert(
+    size <= 256 * 1024,
+    'request_too_large',
+    413,
+    `This request takes ${size} bytes as stored and at most 262144 (256 KiB) are accepted. The size counted is the stored JSON, where escaping can grow text several times (64 KiB of control characters takes about 393 KB). Split the draft into smaller requests or trim its tests, descriptions and body.`,
+  );
   // The ids of what a setup creates differ on every submission, so a resubmission is matched without them.
   const old = await env.DB.prepare(
     "SELECT id FROM access_requests WHERE client_id=? AND status='pending' AND expires_at>? AND json_remove(requested_json,'$.ids')=json(?) LIMIT 1",
@@ -556,21 +570,17 @@ export async function accessRequest(env: Bindings, p: Principal, input: unknown,
     .bind(p.clientId, now(), requested)
     .first<{ id: string }>();
   const rid = old?.id ?? id();
-  // They are fixed on submission, so access.status can name them once the Owner approves.
-  const ids = setup && {
-    ...(setup.secret ? { secretId: id() } : {}),
-    connectionIds: setup.connections.map(() => id()),
-  };
   if (!old) {
-    // The Owner reads every pending request, so one installation holds at most 20 at a time.
+    // The Owner reads every pending request, so one installation holds at most 20 at a time and 1 MiB
+    // of them as stored.
     const result = await env.DB.prepare(
-      "INSERT INTO access_requests (id,owner_id,client_id,requested_json,reason,status,created_at,expires_at,fingerprint) SELECT ?,?,?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM access_requests WHERE client_id=? AND status='pending' AND expires_at>?)<20",
+      "INSERT INTO access_requests (id,owner_id,client_id,requested_json,reason,status,created_at,expires_at,fingerprint) SELECT ?,?,?,?,?,?,?,?,? FROM (SELECT COUNT(*) AS n,IFNULL(SUM(length(CAST(requested_json AS BLOB))+IFNULL(length(CAST(reason AS BLOB)),0)),0) AS bytes FROM access_requests WHERE client_id=? AND status='pending' AND expires_at>?) WHERE n<20 AND bytes+?<=1048576",
     )
       .bind(
         rid,
         p.userId,
         p.clientId,
-        ids ? JSON.stringify({ ...stored, ids }) : requested,
+        value,
         body.reason,
         'pending',
         now(),
@@ -578,14 +588,24 @@ export async function accessRequest(env: Bindings, p: Principal, input: unknown,
         fingerprint,
         p.clientId,
         now(),
+        size,
       )
       .run();
-    assert(
-      result.meta.changes === 1,
-      'too_many_pending',
-      429,
-      'This installation already has 20 requests waiting for the Owner. Wait for the Owner to decide them and tell the user; do not submit this request again until then.',
-    );
+    // D1 counts the row the backup revision trigger updates as a change too.
+    if (result.meta.changes === 0) {
+      const waiting = await env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM access_requests WHERE client_id=? AND status='pending' AND expires_at>?",
+      )
+        .bind(p.clientId, now())
+        .first<{ n: number }>();
+      throw new Fault(
+        'too_many_pending',
+        429,
+        waiting!.n >= 20
+          ? 'This installation already has 20 requests waiting for the Owner. Wait for the Owner to decide them and tell the user; do not submit this request again until then.'
+          : `This request would bring the requests this installation has waiting for the Owner over 1 MiB as stored (this one takes ${size} bytes). Wait for the Owner to decide some and tell the user; a smaller request may still fit.`,
+      );
+    }
   }
   return { id: rid, status: 'pending', approveUrl: `${origin}/?tab=access` };
 }
@@ -665,7 +685,7 @@ export async function accessStatus(env: Bindings, p: Principal, rid: string) {
     row,
     'request_not_found',
     404,
-    'This installation has no access request with this id. Use the id access.request returned; to ask again, call access.request.',
+    'This installation has no access request with this id, or the request is more than about 25 hours old and has been archived. Use the id access.request returned; to ask again, call access.request.',
   );
   // An approved invocation runs once before expires_at; an approved grant request stays approved.
   const status =

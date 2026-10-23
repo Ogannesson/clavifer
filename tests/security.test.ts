@@ -3,6 +3,7 @@ import { Miniflare, convertV4MiniflareOptions, Log, LogLevel } from 'miniflare';
 import { applyMigrations } from '../scripts/migrations.mjs';
 import worker from '../apps/worker/src/index';
 import { checkPath, targetUrl, upstreamHeaders } from '../packages/core/proxy';
+import { parseRootKeys, rootKeyFingerprints } from '../packages/core/crypto';
 import { type Bindings, boundedBytes } from '../apps/worker/src/context';
 import { grantInput, connectionInput } from '../apps/worker/src/vault';
 
@@ -114,11 +115,15 @@ describe('access token claims', () => {
     );
     const db = await mf.getD1Database('DB');
     await applyMigrations(db);
-    env = { DB: db, APP_ORIGIN: origin } as unknown as Bindings;
+    const rootKey = `1:${Buffer.from('t'.repeat(32)).toString('base64url')}`;
+    env = { DB: db, APP_ORIGIN: origin, ROOT_KEY: rootKey } as unknown as Bindings;
     const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
     key = pair.privateKey;
     await db.batch([
       db.prepare("INSERT INTO system_state (key,value,updated_at) VALUES ('owner_user_id','owner',?)").bind(Date.now()),
+      db
+        .prepare("INSERT INTO system_state (key,value,updated_at) VALUES ('root_key_fingerprints',?,?)")
+        .bind(JSON.stringify(await rootKeyFingerprints(parseRootKeys(rootKey))), Date.now()),
       db.prepare(
         `INSERT INTO "oauthClient" (id,clientId,userId,name,redirectUris) VALUES ('client','client','owner','Installation','[]')`,
       ),

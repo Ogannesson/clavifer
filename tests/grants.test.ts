@@ -3,11 +3,11 @@ import { Miniflare, convertV4MiniflareOptions, Log, LogLevel } from 'miniflare';
 import { applyMigrations } from '../scripts/migrations.mjs';
 import { grantStatements } from '../apps/worker/src/index';
 import { metadata, readSecret } from '../apps/worker/src/vault';
-import { encryptSecret } from '../packages/core/crypto';
+import { encryptSecret, parseRootKeys } from '../packages/core/crypto';
 import { type Bindings, type Principal } from '../apps/worker/src/context';
 
 // Real D1 so the upsert, its CASE expression and the stored field subset are exercised as deployed.
-const key = Buffer.from('g'.repeat(32)).toString('base64url');
+const rootKey = `1:${Buffer.from('g'.repeat(32)).toString('base64url')}`;
 const owner = 'owner',
   client = 'client',
   secret = 'secret';
@@ -27,10 +27,9 @@ beforeAll(async () => {
   );
   const db = await mf.getD1Database('DB');
   await applyMigrations(db);
-  env = { DB: db, KEK_RING: `v1:${key}`, ACTIVE_KEK_ID: 'v1' } as unknown as Bindings;
+  env = { DB: db, ROOT_KEY: rootKey } as unknown as Bindings;
   const envelope = await encryptSecret(
-    { v1: key },
-    'v1',
+    parseRootKeys(rootKey),
     { ownerId: owner, secretId: secret, version: 1 },
     { token: 'synthetic-token', account: 'synthetic-account' },
   );

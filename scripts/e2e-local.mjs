@@ -1,6 +1,6 @@
 import { Miniflare, Log, LogLevel, convertV4MiniflareOptions } from 'miniflare';
 import { mkdir } from 'node:fs/promises';
-import { randomBytes, createHash, randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { generateIdentity, identityToRecipient, Decrypter } from 'age-encryption';
 import { createServer } from 'node:http';
@@ -11,44 +11,39 @@ import { resolve } from 'node:path';
 import { hostSmoke } from './host-smoke.mjs';
 import { oauthAcceptance } from './oauth-local-acceptance.mjs';
 import { applyMigrations } from './migrations.mjs';
+import { issueSql, newToken } from './bootstrap-token.mjs';
 
 // Isolated runtime and database; credentials never leave this process or enter logs.
 const origin = 'http://localhost:8787';
-const bootstrap = randomBytes(32).toString('base64url');
 const password = randomBytes(24).toString('base64url');
 // Retain synthetic database/backup artifacts in a unique directory for every run.
 // No test cleanup removes the user's files or previous test evidence.
 const runDirectory = resolve('work', 'e2e-local-' + randomUUID());
 await mkdir(runDirectory, { recursive: true });
-let runtimeNumber = 0;
-const runtime = () => {
-  const state = resolve(runDirectory, String(++runtimeNumber));
-  return new Miniflare(
-    convertV4MiniflareOptions({
-      modules: true,
-      scriptPath: process.env.CLAVIFER_E2E_WORKER_PATH ?? 'dist/worker/index.js',
-      compatibilityDate: '2026-09-11',
-      compatibilityFlags: ['nodejs_compat'],
-      log: new Log(LogLevel.ERROR),
-      d1Databases: ['DB'],
-      d1Persist: resolve(state, 'd1'),
-      r2Buckets: ['BACKUPS'],
-      r2Persist: resolve(state, 'r2'),
-      serviceBindings: {
-        ASSETS: () => new Response('web', { headers: { 'content-type': 'text/html; charset=utf-8' } }),
-      },
-      bindings: {
-        APP_ORIGIN: origin,
-        ALLOW_LOCAL_HTTP: 'true',
-        AUTH_SECRET: randomBytes(32).toString('base64url'),
-        KEK_RING: `v1:${randomBytes(32).toString('base64url')}`,
-        ACTIVE_KEK_ID: 'v1',
-        BOOTSTRAP_HASH: createHash('sha256').update(bootstrap).digest('base64url'),
-      },
-    }),
-  );
-};
-let mf = runtime();
+const rootKey = () => `1:${randomBytes(32).toString('base64url')}`;
+// setOptions with the same state and another key restarts the Worker on the same data.
+const runtime = (state, key) =>
+  convertV4MiniflareOptions({
+    modules: true,
+    scriptPath: process.env.CLAVIFER_E2E_WORKER_PATH ?? 'dist/worker/index.js',
+    compatibilityDate: '2026-09-11',
+    compatibilityFlags: ['nodejs_compat'],
+    log: new Log(LogLevel.ERROR),
+    d1Databases: ['DB'],
+    d1Persist: resolve(runDirectory, state, 'd1'),
+    r2Buckets: ['BACKUPS'],
+    r2Persist: resolve(runDirectory, state, 'r2'),
+    serviceBindings: {
+      ASSETS: () => new Response('web', { headers: { 'content-type': 'text/html; charset=utf-8' } }),
+    },
+    bindings: {
+      APP_ORIGIN: origin,
+      ALLOW_LOCAL_HTTP: 'true',
+      ROOT_KEY: key,
+    },
+  });
+const firstKey = rootKey();
+let mf = new Miniflare(runtime('1', firstKey));
 let upstreamCalls = 0;
 const upstream = createServer((req, res) => {
   upstreamCalls++;
@@ -139,22 +134,58 @@ async function call(path, { method = 'GET', body, expected = 200, owner = false,
   passed++;
   return { r, v };
 }
+// Issues a one-time token into the database as the deployment does; it stays in this process.
+async function issue(database) {
+  const { token: value, binds } = newToken();
+  await database
+    .prepare(issueSql)
+    .bind(...binds)
+    .run();
+  return { 'x-bootstrap-token': value };
+}
+const backupIdentity = await generateIdentity();
+const backupRecipient = await identityToRecipient(backupIdentity);
 try {
   const db = await mf.getD1Database('DB');
   await applyMigrations(db);
-  await call('/bootstrap', {
+  const health = async () => (await call('/healthz')).v;
+  assert.deepEqual(
+    { ...(await health()), version: undefined },
+    { ok: true, service: 'clavifer', version: undefined, keys: 'uninitialized', initialized: false },
+  );
+  const setupToken = await issue(db);
+  assert.deepEqual((await call('/api/setup/token', { method: 'POST', owner: true, headers: setupToken })).v, {
+    initialized: false,
+  });
+  // A setup token resets no Owner.
+  await call('/api/setup/password', {
     method: 'POST',
-    body: { name: 'Test Owner', email: 'owner@example.com', password },
+    body: { password },
     owner: true,
-    headers: { 'x-bootstrap-token': bootstrap },
+    headers: setupToken,
+    expected: 409,
+  });
+  const owner = { name: 'Test Owner', email: 'owner@example.com', password, backupRecipient };
+  await call('/api/setup/owner', { method: 'POST', body: owner, headers: setupToken, expected: 403 });
+  const ownerSetup = await call('/api/setup/owner', {
+    method: 'POST',
+    body: owner,
+    owner: true,
+    headers: setupToken,
     expected: 201,
   });
-  await call('/bootstrap', {
+  assert(
+    ownerSetup.r.headers.getSetCookie().some((c) => c.includes('session_token')),
+    'setup signs the Owner in',
+  );
+  assert.equal((await health()).keys, 'ok');
+  assert.equal((await health()).initialized, true);
+  await call('/api/setup/owner', {
     method: 'POST',
-    body: { name: 'Another', email: 'another@example.com', password },
+    body: { ...owner, email: 'another@example.com' },
     owner: true,
-    headers: { 'x-bootstrap-token': bootstrap },
-    expected: 409,
+    headers: setupToken,
+    expected: 401,
   });
   await call('/api/auth/sign-up/email', {
     method: 'POST',
@@ -172,6 +203,9 @@ try {
     .map((s) => s.split(';')[0])
     .join('; ');
   assert(cookie.includes('session_token'), 'owner session cookie');
+  // No session lookup signs a JWT that nothing reads (disableSettingJwtHeader).
+  const ownerSession = await call('/api/auth/get-session', { owner: true });
+  assert(ownerSession.v?.user && !ownerSession.r.headers.has('set-auth-jwt'), 'get-session without set-auth-jwt');
   // The site's pages and Better Auth answer with their own Response, past the headers a JSON route
   // prepares; both still carry them, a page with the policy written for it.
   const page = await call('/login');
@@ -867,20 +901,93 @@ try {
   passed++;
   for (const cid of [basicConnection, queryConnection, binaryConnection])
     await call('/admin/connections/' + cid, { method: 'DELETE', owner: true });
-  const identity = await generateIdentity();
-  const recipient = await identityToRecipient(identity);
-  const backup = await mf.dispatchFetch(origin + '/admin/backup/export', {
-    method: 'POST',
-    headers: { origin, cookie, 'content-type': 'application/json' },
-    body: JSON.stringify({ recipient }),
-  });
-  assert.equal(backup.status, 200);
+  // Sealing, by the scheduled handler of the built Worker: 2 MB of access requests over 25 hours old
+  // leave the hot table for an archive/ object that R2 checked against its SHA-256, and access.status
+  // no longer finds them. The automatic backup runs after it in the same invocation.
+  const old = Date.now() - 26 * 3600000;
+  await db
+    .prepare(
+      "INSERT INTO access_requests (id,owner_id,client_id,requested_json,reason,status,created_at,expires_at) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000) SELECT printf('sealed-%06d',i),(SELECT value FROM system_state WHERE key='owner_user_id'),?,json_object('invocation',json_object('body',printf('%.*c',1000,'x'))),'r','denied',?+i,?+i+86400000 FROM n",
+    )
+    .bind(client, old, old)
+    .run();
+  assert.equal((await call('/v1/access-requests/sealed-000001', { bearer: true })).v.status, 'denied');
+  await (await mf.getWorker()).scheduled({ cron: '*/15 * * * *' });
+  const segments = (await db.prepare('SELECT kind,object_key,sha256 FROM archive_segments').all()).results;
+  assert.deepEqual(
+    segments.map((s) => s.kind),
+    ['access-request'],
+  );
+  const sealedObject = await (await mf.getR2Bucket('BACKUPS')).head(segments[0].object_key);
+  assert.equal(Buffer.from(sealedObject.checksums.sha256).toString('hex'), segments[0].sha256);
+  await call('/v1/access-requests/sealed-000001', { bearer: true, expected: 404 });
+  assert.equal((await call('/v1/access-requests/sealed-002000', { bearer: true })).v.status, 'denied');
+  assert.equal((await call('/admin/backup/status', { owner: true })).v.lastError, null);
+  // The automatic backup that followed: the v1 snapshot, naming the segment by its key and checksum.
+  const latest = await mf.dispatchFetch(origin + '/admin/backup/latest', { headers: { cookie } });
+  assert.equal(latest.status, 200);
   const decrypter = new Decrypter();
-  decrypter.addIdentity(identity);
-  const snapshot = JSON.parse(await decrypter.decrypt(new Uint8Array(await backup.arrayBuffer()), 'text'));
-  assert.equal(snapshot.secrets[0].values.token, 'rotated-test-only');
-  assert(!('grants' in snapshot));
-  await call('/admin/backup/restore', { method: 'POST', owner: true, body: snapshot, expected: 409 });
+  decrypter.addIdentity(backupIdentity);
+  const snapshot = (await decrypter.decrypt(new Uint8Array(await latest.arrayBuffer()), 'text'))
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(
+    [snapshot[0].format, snapshot[0].kind, snapshot.at(-1).type],
+    ['clavifer-backup-v1', 'automatic', 'end'],
+  );
+  assert(snapshot.some((r) => r.type === 'secret-version' && r.values.token === 'rotated-test-only'));
+  assert.equal(snapshot.filter((r) => r.type === 'archive-identity').length, 1);
+  assert.deepEqual(
+    snapshot.filter((r) => r.type === 'segment').map((r) => [r.key, r.sha256, r.data]),
+    [[segments[0].object_key, segments[0].sha256, null]],
+  );
+  passed++;
+  // Recovering the Owner: a 1-hour token creates no Owner on an initialized instance; it shows the login
+  // email, sets a new password and signs every browser out, while the installation keeps calling.
+  const beforeReset = await deviceLogin(second);
+  const recovery = await issue(db);
+  await call('/api/setup/owner', { method: 'POST', body: owner, owner: true, headers: recovery, expected: 409 });
+  assert.deepEqual((await call('/api/setup/token', { method: 'POST', owner: true, headers: recovery })).v, {
+    initialized: true,
+    email: 'owner@example.com',
+  });
+  const recovered = randomBytes(24).toString('base64url');
+  await call('/api/setup/password', { method: 'POST', body: { password: recovered }, owner: true, headers: recovery });
+  await call('/admin/status', { owner: true, expected: 401 });
+  assert.equal(
+    (await call(`/v1/secrets/${sid}/read`, { method: 'POST', bearer: true })).v.values.token,
+    'rotated-test-only',
+    'an installation keeps working after the Owner was recovered',
+  );
+  // Its refresh token outlives the reset too.
+  const renewal = await mf.dispatchFetch(origin + '/api/auth/oauth2/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: beforeReset.refresh_token,
+      client_id: second,
+      resource: origin + '/v1',
+    }),
+  });
+  const renewed = await renewal.json();
+  assert.equal(renewal.status, 200, `refresh after reset: ${renewed.error ?? 'unexpected'}`);
+  passed++;
+  await call('/v1/secrets', { headers: { authorization: `Bearer ${renewed.access_token}` } });
+  const signInAs = (password, expected = 200) =>
+    call('/api/auth/sign-in/email', {
+      method: 'POST',
+      body: { email: 'owner@example.com', password },
+      headers: { origin, 'cf-connecting-ip': '127.0.0.3' },
+      expected,
+    });
+  await signInAs(password, 401);
+  cookie = (await signInAs(recovered)).r.headers
+    .getSetCookie()
+    .map((s) => s.split(';')[0])
+    .join('; ');
+  await call('/admin/status', { owner: true });
   await call(`/admin/grants/${secretGrant.id}`, { method: 'DELETE', owner: true });
   await call(`/v1/secrets/${sid}/read`, { method: 'POST', bearer: true, expected: 403 });
   const remaining = (await call('/v1/secrets', { bearer: true })).v;
@@ -896,58 +1003,89 @@ try {
   );
   await call('/v1/logout', { method: 'POST', bearer: true });
   await call('/v1/secrets', { bearer: true, expected: 401 });
+  // The same database under another root key refuses everything but /healthz, which tells only that.
+  await mf.setOptions(runtime('1', rootKey()));
+  assert.deepEqual(
+    { ...(await health()), version: undefined },
+    { ok: false, service: 'clavifer', version: undefined, keys: 'mismatch', initialized: true },
+  );
+  assert.equal((await call('/admin/status', { owner: true, expected: 503 })).v.error, 'root_key_mismatch');
+  await call('/api/auth/get-session', { owner: true, expected: 503 });
+  await call('/v1/secrets', { bearer: true, expected: 503 });
+  await mf.setOptions(runtime('1', firstKey));
+  assert.equal((await health()).keys, 'ok');
+  await call('/admin/status', { owner: true });
   await mf.dispose();
-  mf = runtime();
+  mf = new Miniflare(runtime('2', rootKey()));
   cookie = '';
   token = '';
+  // A second instance under another root key, set up from its own token; the Owner's setup response
+  // is its first session.
   const freshDB = await mf.getD1Database('DB');
   await applyMigrations(freshDB);
-  await call('/bootstrap', {
-    method: 'POST',
-    owner: true,
-    body: { name: 'Restored Owner', email: 'restored@example.com', password },
-    headers: { 'x-bootstrap-token': bootstrap },
-    expected: 201,
-  });
-  const freshLogin = await call('/api/auth/sign-in/email', {
-    method: 'POST',
-    owner: true,
-    body: { email: 'restored@example.com', password },
-  });
-  cookie = freshLogin.r.headers
+  cookie = (
+    await call('/api/setup/owner', {
+      method: 'POST',
+      owner: true,
+      body: { name: 'Second Owner', email: 'Second@Example.com', password, backupRecipient },
+      headers: await issue(freshDB),
+      expected: 201,
+    })
+  ).r.headers
     .getSetCookie()
     .map((s) => s.split(';')[0])
     .join('; ');
-  await call('/admin/backup/restore', { method: 'POST', owner: true, body: snapshot });
-  const restored = (await call('/admin/status', { owner: true })).v;
-  assert.equal(restored.secrets.length, 1);
-  assert.equal(restored.connections.length, 1);
-  assert.equal(restored.grants.length, 0);
-  assert.equal(restored.clients.length, 0);
-  const restoredClient = (
+  const fresh = (await call('/admin/status', { owner: true })).v;
+  assert.deepEqual(
+    [fresh.secrets, fresh.connections, fresh.grants, fresh.clients].map((rows) => rows.length),
+    [0, 0, 0, 0],
+  );
+  assert.equal(fresh.backup.recipient, backupRecipient, 'the backup recipient comes with the Owner');
+  const freshSid = (
+    await call('/admin/secrets', {
+      method: 'POST',
+      owner: true,
+      body: { name: 'Second key', values: { token: 'second-instance-test-only' } },
+      expected: 201,
+    })
+  ).v.id;
+  const freshConnection = (
+    await call('/admin/connections', {
+      method: 'POST',
+      owner: true,
+      body: {
+        name: 'Second upstream',
+        origin: upstreamOrigin,
+        paths: ['/get'],
+        methods: ['GET'],
+        auth: { type: 'bearer', secretId: freshSid, field: 'token' },
+      },
+    })
+  ).v.id;
+  const freshClient = (
     await call('/admin/clients', {
       method: 'POST',
       owner: true,
-      body: { name: 'Restored installation' },
+      body: { name: 'Second installation' },
       expected: 201,
     })
   ).v.clientId;
-  token = (await deviceLogin(restoredClient)).access_token;
+  token = (await deviceLogin(freshClient)).access_token;
   await call('/admin/grants', {
     method: 'POST',
     owner: true,
     body: {
-      clientId: restoredClient,
-      grants: [{ resourceType: 'secret', resourceId: sid, permission: 'secret:read' }],
+      clientId: freshClient,
+      grants: [{ resourceType: 'secret', resourceId: freshSid, permission: 'secret:read' }],
     },
   });
   assert.equal(
-    (await call(`/v1/secrets/${sid}/read`, { method: 'POST', bearer: true })).v.values.token,
-    'rotated-test-only',
+    (await call(`/v1/secrets/${freshSid}/read`, { method: 'POST', bearer: true })).v.values.token,
+    'second-instance-test-only',
   );
-  await call('/admin/connections/' + connection, { method: 'DELETE', owner: true });
-  await call('/admin/secrets/' + sid, { method: 'DELETE', owner: true });
-  await call(`/v1/secrets/${sid}/read`, { method: 'POST', bearer: true, expected: 403 });
+  await call('/admin/connections/' + freshConnection, { method: 'DELETE', owner: true });
+  await call('/admin/secrets/' + freshSid, { method: 'DELETE', owner: true });
+  await call(`/v1/secrets/${freshSid}/read`, { method: 'POST', bearer: true, expected: 403 });
   await freshDB
     .prepare(
       'INSERT INTO "oauthClient" (id,clientId,userId,name,redirectUris,disabled,createdAt) VALUES (?,?,NULL,?,?,0,?)',
@@ -977,7 +1115,10 @@ try {
   await call('/admin/grants', {
     method: 'POST',
     owner: true,
-    body: { clientId: staleClient, grants: [{ resourceType: 'secret', resourceId: sid, permission: 'secret:read' }] },
+    body: {
+      clientId: staleClient,
+      grants: [{ resourceType: 'secret', resourceId: freshSid, permission: 'secret:read' }],
+    },
     expected: 403,
   });
   await call('/admin/backup/config', { method: 'PUT', owner: true, body: { recipient: null }, expected: 403 });
@@ -989,7 +1130,12 @@ try {
     auth: { type: 'none' },
   };
   await call('/admin/connections', { method: 'POST', owner: true, body: staleConnection, expected: 403 });
-  await call('/admin/connections/' + connection, { method: 'PUT', owner: true, body: staleConnection, expected: 403 });
+  await call('/admin/connections/' + freshConnection, {
+    method: 'PUT',
+    owner: true,
+    body: staleConnection,
+    expected: 403,
+  });
   await call('/admin/status', { owner: true });
   await call('/api/auth/passkey/delete-passkey', {
     method: 'POST',
@@ -1006,9 +1152,22 @@ try {
   await call('/api/auth/oauth2/client/rotate-secret', {
     method: 'POST',
     owner: true,
-    body: { client_id: restoredClient },
+    body: { client_id: freshClient },
     expected: 403,
   });
+  // /admin/clients is the only writer of installations, whoever asks.
+  for (const route of ['create-client', 'update-client', 'delete-client'])
+    assert.equal(
+      (
+        await call(`/api/auth/oauth2/${route}`, {
+          method: 'POST',
+          owner: true,
+          body: { client_id: freshClient },
+          expected: 403,
+        })
+      ).v.error,
+      'endpoint_disabled',
+    );
   await call('/api/auth/oauth2/update-consent', {
     method: 'POST',
     owner: true,
@@ -1032,16 +1191,16 @@ try {
   await call('/api/auth/sign-in/email', {
     method: 'POST',
     owner: true,
-    body: { email: 'restored@example.com', password },
+    body: { email: 'second@example.com', password },
     expected: 401,
   });
   await call('/api/auth/sign-in/email', {
     method: 'POST',
     owner: true,
-    body: { email: 'restored@example.com', password: changedPassword },
+    body: { email: 'second@example.com', password: changedPassword },
   });
   console.log(
-    `Local E2E passed: ${passed} HTTP assertions plus SDK-to-Go-to-Worker MCP, proxy boundaries, encrypted backup and recovery with a new KEK.`,
+    `Local E2E passed: ${passed} HTTP assertions plus SDK-to-Go-to-Worker MCP, proxy boundaries, encrypted backup, sealing of old access requests, Owner setup and recovery through one-time tokens, and a second instance under another root key.`,
   );
 } finally {
   await mf.dispose();

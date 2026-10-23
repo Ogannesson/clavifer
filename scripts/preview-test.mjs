@@ -1,10 +1,11 @@
 // Local-only, disposable UI acceptance fixture. Never deploy or use real secrets.
 import { Miniflare, convertV4MiniflareOptions, Log, LogLevel } from 'miniflare';
 import { applyMigrations } from './migrations.mjs';
+import { issueSql, newToken } from './bootstrap-token.mjs';
 import { readFile, readdir } from 'node:fs/promises';
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
+import { generateIdentity, identityToRecipient } from 'age-encryption';
 const origin = 'http://localhost:18878';
-const bootstrap = 'synthetic-preview-bootstrap-not-for-real-use';
 const assetFiles = new Map();
 for (const name of ['index.html', ...(await readdir('apps/web/dist/assets')).map((n) => 'assets/' + n)])
   assetFiles.set('/' + name, await readFile('apps/web/dist/' + name));
@@ -36,27 +37,30 @@ const mf = new Miniflare(
     bindings: {
       APP_ORIGIN: origin,
       ALLOW_LOCAL_HTTP: 'true',
-      AUTH_SECRET: randomBytes(32).toString('base64url'),
-      KEK_RING: `v1:${randomBytes(32).toString('base64url')}`,
-      ACTIVE_KEK_ID: 'v1',
-      BOOTSTRAP_HASH: createHash('sha256').update(bootstrap).digest('base64url'),
+      ROOT_KEY: `1:${randomBytes(32).toString('base64url')}`,
     },
   }),
 );
 const db = await mf.getD1Database('DB');
 await applyMigrations(db);
-const response = await mf.dispatchFetch(origin + '/bootstrap', {
+const { token, binds } = newToken();
+await db
+  .prepare(issueSql)
+  .bind(...binds)
+  .run();
+const response = await mf.dispatchFetch(origin + '/api/setup/owner', {
   method: 'POST',
-  headers: { origin, 'content-type': 'application/json', 'x-bootstrap-token': bootstrap },
+  headers: { origin, 'content-type': 'application/json', 'x-bootstrap-token': token },
   body: JSON.stringify({
     name: 'Preview Owner',
     email: 'preview@example.com',
     password: 'Preview-Only-Not-A-Real-Account!',
+    backupRecipient: await identityToRecipient(await generateIdentity()),
   }),
 });
 if (response.status !== 201) {
   await mf.dispose();
-  throw new Error('Preview bootstrap failed: ' + response.status + ' ' + (await response.text()).slice(0, 250));
+  throw new Error('Preview setup failed: ' + response.status + ' ' + (await response.text()).slice(0, 250));
 }
 console.log('Disposable UI fixture listening on http://localhost:18878 (synthetic account only).');
 for (const event of ['SIGINT', 'SIGTERM'])

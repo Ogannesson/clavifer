@@ -18,8 +18,6 @@ export const session = sqliteTable('session', {
   ipAddress: text('ipAddress'),
   userAgent: text('userAgent'),
   userId: text('userId').notNull(),
-  encryptedToken: text('encryptedToken'),
-  bootstrap: integer('bootstrap', { mode: 'boolean' }),
 });
 export const account = sqliteTable('account', {
   id: text('id').primaryKey().notNull(),

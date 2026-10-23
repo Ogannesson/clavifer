@@ -3,7 +3,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
 import { isAPIError } from 'better-auth/api';
 import { SCOPES } from '../../../packages/auth/policy';
-import { equalHash, encryptSecret, decryptSecret } from '../../../packages/core/crypto';
+import { encryptSecret, decryptSecret } from '../../../packages/core/crypto';
 import { Fault, assert } from '../../../packages/core/errors';
 import { targetUrl, matchHost } from '../../../packages/core/proxy';
 import {
@@ -13,8 +13,8 @@ import {
   requireOrigin,
   principal,
   ownerId,
-  cacheOwnerId,
-  parseKeys,
+  rootKeys,
+  keyState,
   now,
   id,
   audit,
@@ -22,6 +22,7 @@ import {
   readJson,
   withRequestId,
   issuesHint,
+  VERSION,
 } from './context';
 import {
   metadata,
@@ -48,14 +49,12 @@ import {
   type StoredRequest,
 } from './vault';
 import { handleMcp } from './mcp';
-import {
-  exportBackup,
-  restoreBackup,
-  backupStatus,
-  configureBackup,
-  runAutomaticBackup,
-  downloadLatestBackup,
-} from './backup';
+import { backupStatus, configureBackup, runAutomaticBackup, downloadLatestBackup } from './backup';
+import { exportId, fullExport, exportStatus, recipientInput } from './export';
+import { sealColdData } from './archive';
+import { tokenState, createOwner, resetOwner, ownerInput, resetInput } from './setup';
+import { startImport, assertImporting, importChunk, commitImport, startInput, chunkInput, commitInput } from './import';
+import { SEGMENT_LINE_LIMIT } from '../../../packages/core/snapshot';
 
 const app = new Hono<{ Bindings: Bindings }>();
 const jsonPolicy =
@@ -84,72 +83,96 @@ app.use('*', async (c, next) => {
     c.res.headers.get('content-type')?.startsWith('text/html') ? pagePolicy : jsonPolicy,
   );
 });
+// Nothing but /healthz runs under a root key the database does not recognize; see keyState.
+app.use('*', async (c, next) => {
+  if (c.req.path !== '/healthz') assert((await keyState(c.env)) !== 'mismatch', 'root_key_mismatch', 503);
+  await next();
+});
 app.use('/api/auth/*', bodyLimit({ maxSize: 1024 * 1024, onError: (c) => c.json({ error: 'body_too_large' }, 413) }));
 // New authorization, plaintext export, backup recipient changes and saving a connection need a
 // recent login. A connection decides which upstream receives which credential, and editing one keeps
-// its existing grants, so both forms reach the same credentials an export would.
+// its existing grants, so both forms reach the same credentials an export would. The full export is a
+// GET, since the browser downloads it through a link (and Hono answers HEAD with the GET handler).
 const recentLoginRequired = (method: string, path: string) =>
-  (method === 'POST' &&
-    (path === '/admin/grants' ||
-      path === '/admin/backup/export' ||
-      path === '/admin/backup/restore' ||
-      /^\/admin\/access-requests\/[^/]+\/approve$/.test(path))) ||
+  (['GET', 'HEAD'].includes(method) && path === '/admin/backup/export') ||
+  (method === 'POST' && (path === '/admin/grants' || /^\/admin\/access-requests\/[^/]+\/approve$/.test(path))) ||
   (method === 'PUT' && path === '/admin/backup/config') ||
   (['POST', 'PUT'].includes(method) && /^\/admin\/connections(\/[^/]+)?$/.test(path));
 app.use('/admin/*', async (c, next) => {
   const write = !['GET', 'HEAD'].includes(c.req.method);
   if (write) requireOrigin(c.req.raw, c.env);
-  await requireOwner(c.req.raw, c.env, write && recentLoginRequired(c.req.method, c.req.path));
+  await requireOwner(c.req.raw, c.env, recentLoginRequired(c.req.method, c.req.path));
   await next();
 });
-app.get('/healthz', (c) => c.json({ ok: true, service: 'clavifer', version: '0.5.0' }));
-app.get('/setup', async (c) => c.json({ initialized: !!(await ownerId(c.env)) }));
-
-app.post('/bootstrap', async (c) => {
+app.get('/healthz', async (c) => {
+  const keys = await keyState(c.env);
+  return c.json({
+    ok: keys !== 'mismatch',
+    service: 'clavifer',
+    version: VERSION,
+    keys,
+    initialized: keys !== 'uninitialized',
+  });
+});
+// The console's /setup page: with the token the deployment issued, create the Owner of an uninitialized
+// instance or give the Owner of an initialized one a new password. Whether the instance is initialized
+// is in /healthz; checking the token tells the page the email the Owner signs in with.
+app.use('/api/setup/*', async (c, next) => {
   requireOrigin(c.req.raw, c.env);
-  const token = c.req.header('x-bootstrap-token');
-  assert(
-    token && c.env.BOOTSTRAP_HASH && (await equalHash(token, c.env.BOOTSTRAP_HASH)),
-    'invalid_bootstrap_token',
-    401,
-  );
-  assert(!(await ownerId(c.env)), 'bootstrap_already_used', 409);
-  const body = z
-    .object({ name: z.string().min(1).max(100), email: z.email(), password: z.string().min(12).max(128) })
-    .parse(await readJson(c.req.raw));
-  const claim = id();
-  const lock = await c.env.DB.prepare(
-    "INSERT OR IGNORE INTO system_state (key,value,updated_at) VALUES ('bootstrap_claim',?,?)",
-  )
-    .bind(claim, now())
-    .run();
-  assert(lock.meta.changes === 1, 'bootstrap_in_progress', 409);
-  try {
-    const result = await (await createAuth(c.env, true)).api.signUpEmail({ body });
-    await c.env.DB.batch([
-      c.env.DB.prepare("INSERT INTO system_state (key,value,updated_at) VALUES ('owner_user_id',?,?)").bind(
-        result.user.id,
-        now(),
+  await next();
+});
+app.post('/api/setup/token', async (c) => {
+  const { owner, email } = await tokenState(c.env, c.req.header('x-bootstrap-token'));
+  return c.json(owner ? { initialized: true, email } : { initialized: false });
+});
+app.post('/api/setup/owner', async (c) => {
+  const input = ownerInput.parse(await readJson(c.req.raw));
+  for (const cookie of await createOwner(c.env, c.req.header('x-bootstrap-token'), input, c.req.raw.headers))
+    c.header('set-cookie', cookie, { append: true });
+  return c.json({ ok: true }, 201);
+});
+app.post('/api/setup/password', async (c) => {
+  await resetOwner(c.env, c.req.header('x-bootstrap-token'), resetInput.parse(await readJson(c.req.raw)));
+  return c.json({ ok: true });
+});
+// Importing a snapshot instead of creating the Owner: the token starts it, the import id it returns
+// carries the chunks and the commit.
+app.post('/api/setup/import', async (c) =>
+  c.json(
+    {
+      importId: await startImport(
+        c.env,
+        c.req.header('x-bootstrap-token'),
+        startInput.parse(await readJson(c.req.raw)),
       ),
-      c.env.DB.prepare(
-        "UPDATE system_state SET value='completed',updated_at=? WHERE key='bootstrap_claim' AND value=?",
-      ).bind(now(), claim),
-    ]);
-    cacheOwnerId(result.user.id);
-    return c.json({ ok: true }, 201);
-  } catch (e) {
-    await c.env.DB.prepare("DELETE FROM system_state WHERE key='bootstrap_claim' AND value=?").bind(claim).run();
-    throw e;
-  }
+    },
+    201,
+  ),
+);
+// A chunk holds about 4 MB of records, or one embedded segment, whose line may take up to 8 MiB.
+app.post('/api/setup/import/chunk', async (c) => {
+  await assertImporting(c.env);
+  return c.json(await importChunk(c.env, chunkInput.parse(await readJson(c.req.raw, SEGMENT_LINE_LIMIT + 64 * 1024))));
+});
+app.post('/api/setup/import/commit', async (c) => {
+  await commitImport(c.env, commitInput.parse(await readJson(c.req.raw)));
+  return c.json({ ok: true });
 });
 app.all('/api/auth/*', async (c) => {
   const path = c.req.path.replace(/\/+$/, '');
   const authorize = path === '/api/auth/oauth2/authorize';
   // An authorization request arrives by GET. The form-encoded POST the library also takes would carry
-  // max_age in its body, past the limit set below.
+  // max_age in its body, past the limit set below. /admin/clients is the only writer of installations,
+  // so a grant or an access request never points at one the library deleted behind its back.
   assert(
-    !['/api/auth/sign-up/email', '/api/auth/change-email', '/api/auth/delete-user'].includes(path) &&
-      !(authorize && c.req.method === 'POST'),
+    ![
+      '/api/auth/sign-up/email',
+      '/api/auth/change-email',
+      '/api/auth/delete-user',
+      '/api/auth/oauth2/create-client',
+      '/api/auth/oauth2/update-client',
+      '/api/auth/oauth2/delete-client',
+    ].includes(path) && !(authorize && c.req.method === 'POST'),
     'endpoint_disabled',
     403,
   );
@@ -184,7 +207,7 @@ app.all('/api/auth/*', async (c) => {
     await requireOwner(c.req.raw, c.env, true);
   }
   if (
-    /\/(device\/(approve|deny)|oauth2\/(consent|continue|create-client|register|update-client|delete-client|rotate-client-secret)|passkey\/(generate-register-options|verify-registration|delete-passkey|update-passkey))$/.test(
+    /\/(device\/(approve|deny)|oauth2\/(consent|continue|register|rotate-client-secret)|passkey\/(generate-register-options|verify-registration|delete-passkey|update-passkey))$/.test(
       path,
     )
   ) {
@@ -240,7 +263,7 @@ app.get('/admin/status', async (c) => {
     ).bind(oid),
   ]);
   const grantRows = grants.results as { fields_json: string | null; extensions_json: string | null }[];
-  const keys = parseKeys(c.env);
+  const keys = rootKeys(c.env);
   const secretRows = secrets.results as { id: string; current_version: number; envelope_json: string }[];
   return c.json({
     // Field names live only inside the ciphertext, so the dashboard decrypts each current version and keeps the keys.
@@ -348,12 +371,7 @@ async function secretStatements(
   body: z.infer<typeof secretInput>,
   requestId?: string,
 ) {
-  const envelope = await encryptSecret(
-    parseKeys(env),
-    env.ACTIVE_KEK_ID ?? 'v1',
-    { ownerId: oid, secretId: sid, version: 1 },
-    body.values,
-  );
+  const envelope = await encryptSecret(rootKeys(env), { ownerId: oid, secretId: sid, version: 1 }, body.values);
   const pending = requestId ? `WHERE ${pendingRequest}` : '';
   const args = requestId ? [requestId, now()] : [];
   return [
@@ -386,12 +404,7 @@ app.put('/admin/secrets/:id', async (c) => {
   const version = body.expectedVersion + 1;
   const old = await boundSecret(c.env, oid, sid);
   const merged = secretInput.shape.values.parse({ ...old.values, ...body.values });
-  const envelope = await encryptSecret(
-    parseKeys(c.env),
-    c.env.ACTIVE_KEK_ID ?? 'v1',
-    { ownerId: oid, secretId: sid, version },
-    merged,
-  );
+  const envelope = await encryptSecret(rootKeys(c.env), { ownerId: oid, secretId: sid, version }, merged);
   await c.env.DB.batch([
     c.env.DB.prepare(
       'INSERT INTO secret_versions (id,secret_id,version,envelope_json,created_at) VALUES (?,?,?,?,?)',
@@ -660,7 +673,7 @@ async function setupStatements(
     connectionInput.parse({ ...draft, auth: draft.auth.type === 'none' ? draft.auth : { ...draft.auth, secretId } }),
   );
   const audited = (action: string, resource: string) =>
-    auditStatement(env, 'owner', action, resource, 'ok', `WHERE ${pendingRequest}`, [rid, now()]);
+    auditStatement(env, 'owner', action, resource, { where: `WHERE ${pendingRequest}`, args: [rid, now()] });
   const writes = [
     ...connections.map((connection, i) =>
       insertConnection(
@@ -779,30 +792,25 @@ export async function decideRequest(
         ).bind(approve ? 'approved' : 'denied', rid, now(), ...(edited ?? [])),
   );
   const results = await env.DB.batch(statements);
-  assert(results[results.length - 1].meta.changes === 1, 'request_not_found', 404);
+  // D1 counts the row the backup revision trigger updates as a change too.
+  assert(results[results.length - 1].meta.changes > 0, 'request_not_found', 404);
   // What an approval created or changed is audited as the Owner's own forms audit it; an approved
   // setup wrote its rows in the batch.
   if (approve && requested.setup) return;
   if (approve && requested.update) await audit(env, 'owner', 'connection:save', requested.update.connection);
   await audit(env, 'owner', `access:${approve ? 'approve' : 'deny'}`, rid);
 }
-app.post('/admin/backup/export', async (c) => {
-  const body = z.object({ recipient: z.string().min(10).max(200) }).parse(await readJson(c.req.raw));
-  const encrypted = await exportBackup(c.env, await ownerId(c.env), body.recipient);
-  return new Response(new Uint8Array(encrypted).buffer, {
-    headers: {
-      'content-type': 'application/octet-stream',
-      'content-disposition': `attachment; filename="clavifer-${new Date().toISOString().slice(0, 10)}.age"`,
-      'cache-control': 'no-store',
-    },
-  });
+// The complete state of the instance, streamed; see fullExport for how the console learns it finished.
+// The recipient is in the link, so a page of another site could otherwise have the browser download the
+// Owner's credentials encrypted to its own key; only the console's own page may start one.
+app.get('/admin/backup/export', async (c) => {
+  assert(c.req.header('sec-fetch-site') === 'same-origin', 'cross_site_request', 403);
+  return fullExport(c.env, await ownerId(c.env), c.req.query('recipient') ?? '', exportId.parse(c.req.query('id')));
 });
-app.post('/admin/backup/restore', async (c) =>
-  c.json(await restoreBackup(c.env, await ownerId(c.env), await readJson(c.req.raw, 8 * 1024 * 1024))),
-);
+app.get('/admin/backup/exports/:id', async (c) => c.json(await exportStatus(c.env, exportId.parse(c.req.param('id')))));
 app.get('/admin/backup/status', async (c) => c.json(await backupStatus(c.env)));
 app.put('/admin/backup/config', async (c) => {
-  const body = z.object({ recipient: z.string().trim().min(10).max(200).nullable() }).parse(await readJson(c.req.raw));
+  const body = z.object({ recipient: recipientInput.nullable() }).parse(await readJson(c.req.raw));
   return c.json(await configureBackup(c.env, body.recipient));
 });
 app.post('/admin/backup/run', async (c) => c.json(await runAutomaticBackup(c.env, await ownerId(c.env), true)));
@@ -885,7 +893,11 @@ export default {
   fetch: (request: Request, env: Bindings, ctx: ExecutionContext) => app.fetch(request, env, ctx),
   scheduled: (event: ScheduledController, env: Bindings) =>
     withRequestId(String(event.scheduledTime), async () => {
+      // An uninitialized instance has nothing to seal or back up, and a mismatched one must not be read or written.
+      if ((await keyState(env)) !== 'ok') return;
       const owner = await ownerId(env);
-      if (owner) await runAutomaticBackup(env, owner);
+      // Sealing first keeps the hot data, and so the backup, small.
+      await sealColdData(env, owner);
+      await runAutomaticBackup(env, owner);
     }),
 };

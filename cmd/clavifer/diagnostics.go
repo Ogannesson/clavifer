@@ -208,16 +208,30 @@ func diagnose(ctx context.Context, offline bool) diagnosticReport {
 		OK      bool   `json:"ok"`
 		Service string `json:"service"`
 		Version string `json:"version"`
+		Keys    string `json:"keys"`
+	}
+	var api *apiError
+	if errors.As(err, &api) && api.Status == http.StatusServiceUnavailable && api.Code == "invalid_root_key" {
+		r.add("server", "fail", "The service's ROOT_KEY secret cannot be parsed, so it answers no requests; its operator must fix the Worker secret.")
+		return r
 	}
 	if err != nil {
 		r.add("server", "fail", diagnosticError(err))
 		return r
 	}
-	if json.Unmarshal(b, &health) != nil || !health.OK || health.Service != "clavifer" || !releaseVersion.MatchString(health.Version) {
+	if json.Unmarshal(b, &health) != nil || health.Service != "clavifer" || !releaseVersion.MatchString(health.Version) || (!health.OK && health.Keys != "mismatch") {
 		r.add("server", "fail", "The address did not return a valid Clavifer health response.")
 		return r
 	}
 	r.ServerVersion = health.Version
+	if health.Keys == "mismatch" {
+		r.add("server", "fail", "The service's root key does not match its database, so it refuses every request; its operator must restore the original ROOT_KEY or rebuild the instance from a backup.")
+		return r
+	}
+	if health.Keys == "uninitialized" {
+		r.add("server", "fail", "The service has no Owner yet; its operator must finish setup on the /setup page with the deployment's bootstrap token.")
+		return r
+	}
 	r.add("server", "pass", "The Clavifer service is reachable.")
 	if !credentialsReady {
 		r.add("metadata", "skip", "A valid system-store login is required.")

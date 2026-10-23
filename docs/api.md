@@ -2,12 +2,12 @@
 
 Clavifer has two interfaces for installations, a REST API and an MCP server, and one REST interface for the Owner's web console. This page gives an overview of the routes, describes the four MCP tools with their inputs and outputs, and says where the machine-readable contract is. The exact schemas are in the generated OpenAPI document and in the tool list the MCP server publishes; this page does not repeat them.
 
-| Interface             | Path                        | Caller              | Authentication                             |
-| --------------------- | --------------------------- | ------------------- | ------------------------------------------ |
-| MCP server            | `/v1/mcp`                   | Installation        | OAuth access token (Bearer)                |
-| Installation REST API | `/v1/*`                     | Installation        | OAuth access token (Bearer)                |
-| Owner REST API        | `/admin/*`                  | The console         | Owner session cookie, same origin          |
-| Authentication        | `/api/auth/*`, `/bootstrap` | Browser, `clavifer` | See [authentication.md](authentication.md) |
+| Interface             | Path                          | Caller              | Authentication                             |
+| --------------------- | ----------------------------- | ------------------- | ------------------------------------------ |
+| MCP server            | `/v1/mcp`                     | Installation        | OAuth access token (Bearer)                |
+| Installation REST API | `/v1/*`                       | Installation        | OAuth access token (Bearer)                |
+| Owner REST API        | `/admin/*`                    | The console         | Owner session cookie, same origin          |
+| Authentication        | `/api/auth/*`, `/api/setup/*` | Browser, `clavifer` | See [authentication.md](authentication.md) |
 
 All timestamps are milliseconds since the Unix epoch. `null` in an expiry field means no expiry.
 
@@ -53,6 +53,8 @@ The codes for connection requests and access requests, with the next step for ea
 | `not_found`                                               | 404    | No such route.                                                                   |
 | `conflict`                                                | 409    | A unique value, such as a name, is already in use.                               |
 | `internal_error`                                          | 500    | Unexpected failure. Quote the `request_id` when reporting it.                    |
+| `root_key_mismatch`                                       | 503    | The Worker's root key is not the one the database recorded. Every route but `/healthz` answers this. See [security-model.md](security-model.md#the-root-key). |
+| `invalid_root_key`                                        | 503    | The Worker's `ROOT_KEY` cannot be parsed. On an initialized instance every route answers this, `/healthz` included. |
 
 ## Installation REST API
 
@@ -191,7 +193,7 @@ Submits a request for the Owner to decide. Arguments:
 | Argument    | Required     | Content                                                                       |
 | ----------- | ------------ | ----------------------------------------------------------------------------- |
 | `requested` | Yes          | An object with exactly one of `grants`, `invocation`, `setup`, `update`       |
-| `reason`    | Yes over MCP | Up to 500 characters for the Owner. Over REST it defaults to an empty string. |
+| `reason`    | Yes          | Up to 500 characters for the Owner. Required in the MCP tool schema; when it is missing, the server stores an empty string. |
 
 What each of the four holds, with a complete example of each, is in [connections.md](connections.md#access-requests). The example for a secret grant is [above](#reading-a-secret).
 
@@ -222,6 +224,8 @@ Takes `{"id": "REQUEST_ID"}`. An installation can read only its own requests.
 | `executed` | An approved invocation was sent.                                                   | `expires_at`                                                                                                                        |
 | `denied`   | The Owner denied it, or the installation was revoked.                              | None                                                                                                                                |
 | `expired`  | Not decided within 24 hours, or an approved invocation not sent within 10 minutes. | `expires_at`                                                                                                                        |
+
+A request more than about 25 hours old may have been moved to the [archive](security-model.md#cold-data); `access.status` then answers `request_not_found`.
 
 An approved grant request lists the grants as they stand now, not as they were approved:
 
@@ -264,8 +268,10 @@ The console is the only intended client of `/admin/*`. Every route needs the Own
 | `POST /admin/connections`, `PUT /admin/connections/{id}`, `DELETE /admin/connections/{id}`                                                                              | Create, edit, and delete a connection                                                                                                                                                     |
 | `POST /admin/grants`, `DELETE /admin/grants/{id}`                                                                                                                       | Create and revoke grants                                                                                                                                                                  |
 | `POST /admin/access-requests/{id}/approve`, `POST /admin/access-requests/{id}/deny`                                                                                     | Decide an access request                                                                                                                                                                  |
-| `POST /admin/backup/export`, `POST /admin/backup/restore`, `PUT /admin/backup/config`, `GET /admin/backup/status`, `POST /admin/backup/run`, `GET /admin/backup/latest` | Backups. See [security-model.md](security-model.md#backups).                                                                                                                              |
+| `GET /admin/backup/export`, `GET /admin/backup/exports/{id}`, `PUT /admin/backup/config`, `GET /admin/backup/status`, `POST /admin/backup/run`, `GET /admin/backup/latest` | Full export and its completion status, the backup recipient, automatic backups. See [security-model.md](security-model.md#backups).                                                     |
 
-No route returns a stored secret value to the Owner. The values leave the server only through `POST /v1/secrets/{id}/read` and inside an encrypted backup.
+No route returns a stored secret value to the Owner. The values leave the server only through `POST /v1/secrets/{id}/read` and inside an encrypted snapshot: an automatic backup or a full export.
 
-Public routes that need no authentication: `GET /healthz` returns `{"ok": true, "service": "clavifer", "version": "0.5.0"}`, and `GET /setup` returns `{"initialized": true}` once an Owner exists.
+The console's `/setup` page calls `/api/setup/*` with the one-time bootstrap token, to create the Owner, import a snapshot, or reset the Owner's password. See [authentication.md](authentication.md#bootstrap-token).
+
+`GET /healthz` needs no authentication. It returns `{"ok", "service", "version", "keys", "initialized"}`: `keys` is `ok`, `mismatch` (the root key is not the one the database recorded; `ok` is then `false`), or `uninitialized` (no Owner yet).

@@ -1,4 +1,4 @@
-import { fault, relativeText, timeText } from '../api';
+import { archiveErrorMessage, fault, relativeText, timeText } from '../api';
 import { PageHead, RefreshButton, type AppApi, type TabId } from '../shell';
 import { Badge, Icon, Loading, Panel, type Tone } from '../ui';
 import { isExpiringSoon, PendingCard } from './access';
@@ -7,7 +7,7 @@ import { resultTone } from './audit';
 
 type Action = { label: string; primary?: boolean; onClick: () => void };
 type Item = {
-  tone: Exclude<Tone, 'accent' | 'neutral'>;
+  tone: Exclude<Tone, 'accent'>;
   icon: string;
   title: string;
   body: string;
@@ -26,13 +26,30 @@ function backupItem(app: AppApi): Item {
       body: '配置 age 公钥后，服务每 15 分钟检查变更并保存加密副本。没有备份时，删除凭据不可恢复。',
       actions: [open('去配置备份')],
     };
+  // Over the hot-data limit the backup waits for sealing, which is failing too: it will not recover alone.
+  if (backup.lastError === 'hot_data_over_limit' && backup.archiveError)
+    return {
+      tone: 'danger',
+      icon: 'alert',
+      title: '热数据超限，且冷数据封存失败',
+      body: `自动备份因热数据超过 9 MB 而跳过，要等旧的审计和访问申请封存后才能恢复，但封存失败了：${archiveErrorMessage(backup.archiveError)} 封存恢复之前自动备份会一直跳过，请先用完整导出保存一份。上次成功：${backup.lastSuccessAt ? timeText(backup.lastSuccessAt) : '尚未成功过'}。`,
+      actions: [open('查看原因')],
+    };
   if (backup.lastError)
     return {
       tone: 'danger',
       icon: 'alert',
-      title: '最近一次自动备份失败',
+      title: backup.lastError === 'hot_data_over_limit' ? '热数据超限，自动备份已跳过' : '最近一次自动备份失败',
       body: `${fault(backup.lastError).message} 上次成功：${backup.lastSuccessAt ? timeText(backup.lastSuccessAt) : '尚未成功过'}。`,
       actions: [open('查看原因'), runNow],
+    };
+  if (backup.archiveError)
+    return {
+      tone: 'warn',
+      icon: 'archive',
+      title: '冷数据封存失败',
+      body: archiveErrorMessage(backup.archiveError),
+      actions: [open('查看备份状态')],
     };
   if (backup.retentionError)
     return {
@@ -42,12 +59,13 @@ function backupItem(app: AppApi): Item {
       body: '最新备份已保存成功，只是旧副本没能删除。下一次成功备份会重试清理。',
       actions: [open('查看备份状态')],
     };
+  // Every call of an installation writes an audit row, so while agents work this is the normal state.
   if (backup.pending)
     return {
-      tone: 'warn',
+      tone: 'neutral',
       icon: 'info',
-      title: '有改动尚未备份',
-      body: `凭据或连接在上次备份后发生过变化，计划任务会在 ${backup.scheduleMinutes} 分钟内保存新副本。`,
+      title: '有改动等待下一次备份',
+      body: `实例的数据在上次备份后发生过变化，计划任务会在 ${backup.scheduleMinutes} 分钟内保存新副本。最近成功备份：${timeText(backup.lastSuccessAt)}。`,
       actions: [runNow, open()],
     };
   return {

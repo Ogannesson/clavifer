@@ -9,7 +9,9 @@ export const tokenHash = async (token: string) => {
 };
 export function authPlugins(origin: string, ownerId = OWNER) {
   return [
-    jwt(),
+    // Nothing reads the set-auth-jwt header, and signing one on every session lookup would make the
+    // whole console fail whenever the signing key cannot be decrypted.
+    jwt({ disableSettingJwtHeader: true }),
     passkey({ rpID: new URL(origin).hostname, rpName: 'Clavifer', origin }),
     oauthProvider({
       // The API takes a JWT access token issued for the one resource below. The Worker verifies its
@@ -43,8 +45,4 @@ export const emailPassword = {
   requireEmailVerification: false,
   autoSignIn: true,
   minPasswordLength: 12,
-};
-export const additionalSessionFields = {
-  encryptedToken: { type: 'string' as const, required: false, returned: false, input: false },
-  bootstrap: { type: 'boolean' as const, defaultValue: false, returned: false, input: false },
 };

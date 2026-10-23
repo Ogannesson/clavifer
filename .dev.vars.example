@@ -1,6 +1,3 @@
-# The fields of .dev.vars. Do not copy this file: `node scripts/init-secrets.mjs` creates .dev.vars
-# with generated values and refuses when the file already exists.
-AUTH_SECRET=
-KEK_RING=
-ACTIVE_KEK_ID=v1
-BOOTSTRAP_HASH=
+# The fields of .dev.vars. Do not copy this file: `npm run deploy -- --local` creates .dev.vars
+# with a generated root key and never replaces an existing one.
+ROOT_KEY=

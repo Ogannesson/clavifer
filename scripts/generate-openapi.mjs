@@ -12,11 +12,13 @@ import {
   resourceId,
   valuesSchema,
 } from '../apps/worker/src/vault.ts';
-import { backupSchema } from '../apps/worker/src/backup.ts';
+import { recipientInput } from '../apps/worker/src/export.ts';
+import { ownerInput, resetInput } from '../apps/worker/src/setup.ts';
+import { startInput, chunkInput, commitInput } from '../apps/worker/src/import.ts';
+import { VERSION as version } from '../apps/worker/src/context.ts';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const output = resolve(root, 'packages/contracts/openapi.json');
-const version = '0.5.0';
 
 function schema(value) {
   const result = z.toJSONSchema(value, { target: 'draft-2020-12', unrepresentable: 'any' });
@@ -35,38 +37,120 @@ const error = {
 const owner = [{ OwnerCookie: [] }];
 const agent = [{ AgentBearer: [] }];
 const both = [{ OwnerCookie: [] }, { AgentBearer: [] }];
+// The console's random name for one full export, in the download link and in the status query.
+const exportIdParameter = { name: 'id', required: true, schema: { type: 'string', pattern: '^[A-Za-z0-9_-]{22,64}$' } };
+// The one-time token the deployment issued, only ever sent in this header.
+const bootstrapToken = { name: 'X-Bootstrap-Token', in: 'header', required: true, schema: { type: 'string' } };
 
 const paths = {
   '/healthz': {
     get: {
       operationId: 'health',
       summary: 'Service health',
+      description:
+        'ok is false when the root key does not match the fingerprints the database recorded; every other route then answers 503 root_key_mismatch. On an initialized instance a root key that cannot be parsed makes every route, this one included, answer 503 invalid_root_key.',
       responses: {
         200: json('Health status', {
           ok: { type: 'boolean' },
           service: { type: 'string' },
           version: { type: 'string' },
+          keys: { type: 'string', enum: ['ok', 'mismatch', 'uninitialized'] },
+          initialized: { type: 'boolean' },
         }),
       },
     },
   },
-  '/setup': {
-    get: {
-      operationId: 'setupStatus',
-      summary: 'Whether initial Owner bootstrap is complete',
-      responses: { 200: json('Setup status', { initialized: { type: 'boolean' } }) },
+  '/api/setup/token': {
+    post: {
+      operationId: 'checkBootstrapToken',
+      summary: 'Check the one-time token without spending it',
+      description:
+        'Same origin only. Answers for the live token whether the instance is initialized and, once it is, the email the Owner signs in with; any other token is refused with invalid_bootstrap_token.',
+      parameters: [bootstrapToken],
+      responses: {
+        200: json('What the token can do', { initialized: { type: 'boolean' }, email: { type: 'string' } }, [
+          'initialized',
+        ]),
+        401: error,
+        403: error,
+      },
     },
   },
-  '/bootstrap': {
+  '/api/setup/owner': {
     post: {
-      operationId: 'bootstrapOwner',
-      summary: 'Create the single Owner account',
-      description: 'Requires the one-time X-Bootstrap-Token and same-origin request.',
-      parameters: [
-        { name: 'X-Bootstrap-Token', in: 'header', required: true, schema: { type: 'string', minLength: 16 } },
-      ],
-      requestBody: { required: true, content: { 'application/json': { schema: ref('BootstrapInput') } } },
-      responses: { 201: json('Created'), 400: error, 401: error, 409: error },
+      operationId: 'createOwner',
+      summary: 'Create the Owner of an uninitialized instance',
+      description:
+        'Same origin only. Spends the token issued for an uninitialized instance (valid 24 hours). In one transaction it empties the instance and writes the Owner, its password, the backup recipient, a new archive identity and the root key fingerprints; the response signs the Owner in. A token that is wrong, expired or already spent is refused with invalid_bootstrap_token, an initialized instance with already_initialized.',
+      parameters: [bootstrapToken],
+      requestBody: { required: true, content: { 'application/json': { schema: ref('OwnerInput') } } },
+      responses: {
+        201: json('Created and signed in', { ok: { type: 'boolean' } }),
+        400: error,
+        401: error,
+        403: error,
+        409: error,
+      },
+    },
+  },
+  '/api/setup/password': {
+    post: {
+      operationId: 'resetOwnerLogin',
+      summary: 'Give the Owner of an initialized instance a new password',
+      description:
+        'Same origin only. Spends the token issued for an initialized instance (valid 1 hour). Sets the password and removes every Passkey and browser session of the Owner; installations, grants and their refresh tokens stay. An uninitialized instance is refused with not_initialized.',
+      parameters: [bootstrapToken],
+      requestBody: { required: true, content: { 'application/json': { schema: ref('PasswordReset') } } },
+      responses: { 200: json('Reset', { ok: { type: 'boolean' } }), 400: error, 401: error, 403: error, 409: error },
+    },
+  },
+  '/api/setup/import': {
+    post: {
+      operationId: 'startImport',
+      summary: 'Start importing a snapshot into an uninitialized instance',
+      description:
+        'Same origin only. The console decrypts a clavifer-backup-v1 snapshot in the browser and sends its header and owner records here; the rest follow in chunks and a commit. Spends the token issued for an uninitialized instance (valid 24 hours) and in one transaction empties the instance and records the import, whose id the response returns: like the token it grants the import, and it only ever travels in bodies. A header of a later format, or an Owner password derived with other scrypt parameters, is refused with invalid_snapshot; an initialized instance with already_initialized. A new start replaces any import in progress.',
+      parameters: [bootstrapToken],
+      requestBody: { required: true, content: { 'application/json': { schema: ref('ImportStart') } } },
+      responses: {
+        201: json('Import started', { importId: { type: 'string' } }, ['importId']),
+        400: error,
+        401: error,
+        403: error,
+        409: error,
+      },
+    },
+  },
+  '/api/setup/import/chunk': {
+    post: {
+      operationId: 'importChunk',
+      summary: 'Write a chunk of snapshot records',
+      description:
+        'Same origin only. Records of the types secret to segment, each checked against the v1 format, written in one transaction with the chunk seq, so a chunk sent again answers written without writing twice. Only structure and references are checked, never the business rules of this version. Credential versions are encrypted under this instance’s root key; an embedded segment is stored under a new key after its SHA-256 matched. A referenced segment (automatic backup) must be in this instance’s bucket with the checksum its record names; when one is not, nothing is written and missing lists them, and the chunk can be sent again with those in skip to go on without them. An import that is no longer the one in progress is refused with import_superseded, before the body is read when no import is in progress at all. Up to 8 MiB and 64 KiB.',
+      requestBody: { required: true, content: { 'application/json': { schema: ref('ImportChunk') } } },
+      responses: {
+        200: json('Written, or the referenced segments that are not in the bucket', {
+          written: { type: 'boolean' },
+          missing: {
+            type: 'array',
+            items: { type: 'object', properties: { kind: { type: 'string' }, seq: { type: 'integer' } } },
+          },
+        }),
+        400: error,
+        403: error,
+        409: error,
+        413: error,
+      },
+    },
+  },
+  '/api/setup/import/commit': {
+    post: {
+      operationId: 'commitImport',
+      summary: 'Complete an import and initialize the instance',
+      description:
+        'Same origin only. Takes the settings, archive-identity (or null) and end records. Refused with import_incomplete unless the written records are exactly what end counts (skipped segments included), with snapshot_inconsistent unless every grant and access request names an imported installation, every grant an imported resource, every active connection an active credential with the fields it injects, every active credential exactly its versions, and the segments and remaining rows of each kind are in order. Then one transaction writes the Owner with its password, its Passkeys if the snapshot comes from this hostname, the archive identity (a new one if the snapshot has none), the root key fingerprints, the backup recipient and an instance:import audit row, and removes any token issued meanwhile; the Owner signs in afterwards. It is refused with import_superseded when the import is no longer the one in progress or a chunk arrived after its checks.',
+      requestBody: { required: true, content: { 'application/json': { schema: ref('ImportCommit') } } },
+      responses: { 200: json('Imported', { ok: { type: 'boolean' } }), 400: error, 403: error, 409: error },
     },
   },
   '/admin/status': {
@@ -220,38 +304,45 @@ const paths = {
     },
   },
   '/admin/backup/export': {
-    post: {
-      operationId: 'exportBackup',
-      summary: 'Export encrypted secret and connection snapshot',
+    get: {
+      operationId: 'fullExport',
+      summary: 'Stream the complete state of the instance as an age-encrypted v1 full snapshot',
+      description:
+        'Requires a login within the last 10 minutes and Sec-Fetch-Site: same-origin (a browser download started by the console itself; anything else is refused with cross_site_request). Every sealed segment is embedded; one missing from the bucket or without the checksum its manifest row recorded refuses the export before the first byte (archive_segment_unavailable), as an inconsistent instance does (backup_has_*). The download is whole only once GET /admin/backup/exports/{id} reports complete: a stream that breaks off still ends cleanly for the client.',
       security: owner,
-      requestBody: { required: true, content: { 'application/json': { schema: ref('BackupExportInput') } } },
+      parameters: [
+        { name: 'recipient', in: 'query', required: true, schema: { type: 'string' } },
+        { ...exportIdParameter, in: 'query' },
+      ],
       responses: {
         200: {
-          description: 'Age-encrypted binary backup',
+          description: 'Age-encrypted JSON Lines snapshot (clavifer-backup-v1, kind full)',
           content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } },
         },
         400: error,
         401: error,
         403: error,
+        409: error,
       },
     },
   },
-  '/admin/backup/restore': {
-    post: {
-      operationId: 'restoreBackup',
-      summary: 'Restore an encrypted snapshot already decrypted by the client',
+  '/admin/backup/exports/{id}': {
+    get: {
+      operationId: 'fullExportStatus',
+      summary: 'How far the full export with this id got',
       security: owner,
-      requestBody: { required: true, content: { 'application/json': { schema: ref('BackupSnapshot') } } },
+      parameters: [{ ...exportIdParameter, in: 'path' }],
       responses: {
-        200: json('Restored', {
-          secrets: { type: 'integer' },
-          connections: { type: 'integer' },
-          requiresNewGrants: { type: 'boolean' },
-        }),
+        200: json(
+          'complete after its last byte was written, failed with the code of a refusal, started while it runs or after it broke off, unknown when it never began',
+          {
+            status: { type: 'string', enum: ['complete', 'started', 'failed', 'unknown'] },
+            error: { type: 'string' },
+          },
+          ['status'],
+        ),
         400: error,
         401: error,
-        403: error,
-        409: error,
       },
     },
   },
@@ -287,6 +378,8 @@ const paths = {
     post: {
       operationId: 'runBackup',
       summary: 'Run an immediate automatic backup',
+      description:
+        'An inconsistent instance is refused (409, backup_has_*) and hot data over 9 MB skips the backup (413, hot_data_over_limit); either way the last saved backup stays current.',
       security: owner,
       responses: {
         200: json('Run result', {
@@ -295,6 +388,8 @@ const paths = {
           sha256: { type: 'string' },
         }),
         401: error,
+        409: error,
+        413: error,
         503: error,
       },
     },
@@ -303,10 +398,12 @@ const paths = {
     get: {
       operationId: 'downloadLatestBackup',
       summary: 'Download latest encrypted automatic backup',
+      description:
+        'A v1 snapshot of kind automatic. It names each sealed segment by its key in the same bucket instead of carrying it, so it is complete only together with that bucket.',
       security: owner,
       responses: {
         200: {
-          description: 'Age-encrypted binary backup',
+          description: 'Age-encrypted JSON Lines snapshot (clavifer-backup-v1, kind automatic)',
           content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } },
         },
         401: error,
@@ -362,7 +459,7 @@ const paths = {
       operationId: 'requestAccess',
       summary: 'Request Owner approval for grants, one exact invocation, or a draft of a new or changed connection',
       description:
-        'requested holds one of grants, invocation, setup or update. A connection grant may carry paths and/or methods, a temporary scope extension beyond the connection’s allowed paths and methods that ends with the grant. An invocation (body up to 64 KiB) is checked only against the connection and its deny rules on submission, so it may lie outside the allowed paths and methods; once approved, the identical request (method, path as sent, sorted query, forwarded caller headers, body) runs once within 10 minutes through MCP http.request. REST clients add their own headers, so the REST proxy cannot replay it. An invocation may name origin, another origin than the connection’s own that the connection’s hosts or anyHost cover (host_not_allowed otherwise); the approval then runs only with that origin, and the REST proxy, which always goes to the connection’s own origin, cannot name one. A setup drafts a new credential by field names and the 1 to 20 connections using it, each with its own tests and optionally hosts but never anyHost, never an existing secret; an update changes a connection’s name, description, paths, methods or rules, never its origin or auth. Both are checked as the Owner’s forms check them and carry tests the server runs on the draft policy on submission; any mismatch refuses the submission with tests_failed, listing each one. The Owner enters a setup’s credential values on approval; neither carries a grant. An installation holds at most 20 pending requests: one more is refused with too_many_pending until the Owner decides some, while resubmitting a pending request still returns it.',
+        'requested holds one of grants, invocation, setup or update. A connection grant may carry paths and/or methods, a temporary scope extension beyond the connection’s allowed paths and methods that ends with the grant. An invocation (body up to 64 KiB) is checked only against the connection and its deny rules on submission, so it may lie outside the allowed paths and methods; once approved, the identical request (method, path as sent, sorted query, forwarded caller headers, body) runs once within 10 minutes through MCP http.request. REST clients add their own headers, so the REST proxy cannot replay it. An invocation may name origin, another origin than the connection’s own that the connection’s hosts or anyHost cover (host_not_allowed otherwise); the approval then runs only with that origin, and the REST proxy, which always goes to the connection’s own origin, cannot name one. A setup drafts a new credential by field names and the 1 to 20 connections using it, each with its own tests and optionally hosts but never anyHost, never an existing secret; an update changes a connection’s name, description, paths, methods or rules, never its origin or auth. Both are checked as the Owner’s forms check them and carry tests the server runs on the draft policy on submission; any mismatch refuses the submission with tests_failed, listing each one. The Owner enters a setup’s credential values on approval; neither carries a grant. A request takes at most 256 KiB as stored, counted on its JSON after escaping (request_too_large). An installation holds at most 20 pending requests and 1 MiB of them as stored: one more is refused with too_many_pending until the Owner decides some, while resubmitting a pending request still returns it.',
       security: agent,
       requestBody: { required: true, content: { 'application/json': { schema: ref('AccessRequest') } } },
       responses: {
@@ -374,6 +471,7 @@ const paths = {
         400: error,
         401: error,
         403: error,
+        413: error,
         429: error,
       },
     },
@@ -473,9 +571,11 @@ const paths = {
 };
 
 const schemas = {
-  BootstrapInput: schema(
-    z.object({ name: z.string().min(1).max(100), email: z.string().email(), password: z.string().min(12).max(128) }),
-  ),
+  OwnerInput: schema(ownerInput),
+  PasswordReset: schema(resetInput),
+  ImportStart: schema(startInput),
+  ImportChunk: schema(chunkInput),
+  ImportCommit: schema(commitInput),
   SecretInput: schema(secretInput),
   Secret: schema(secretInput.extend({ id: resourceId, version: z.number().int().optional() })),
   SecretReadInput: schema(readInput),
@@ -500,9 +600,7 @@ const schemas = {
       origin: z.string().optional(),
     }),
   ),
-  BackupExportInput: schema(z.object({ recipient: z.string().min(10).max(200) })),
-  BackupConfigInput: schema(z.object({ recipient: z.string().trim().min(10).max(200).nullable() })),
-  BackupSnapshot: schema(backupSchema),
+  BackupConfigInput: schema(z.object({ recipient: recipientInput.nullable() })),
   InvokeInput: schema(invokeInput),
   Error: {
     type: 'object',
@@ -589,6 +687,15 @@ const schemas = {
         type: ['string', 'null'],
         description: 'Set when deleting superseded snapshots failed; the backup itself still succeeded.',
       },
+      archiveError: {
+        type: ['string', 'null'],
+        description: 'The error that stopped the last run sealing old audit rows and access requests into archive/.',
+      },
+      unsealedBytes: {
+        type: 'integer',
+        description:
+          'Bytes of the data sealing never moves out (the Owner, credentials and their versions, connections, installations, grants, the segment manifest). The automatic backup is skipped while the hot data exceeds 9 MB.',
+      },
     },
   },
   AdminStatus: {
@@ -622,7 +729,7 @@ const document = {
         in: 'cookie',
         name: 'better-auth.session_token',
         description:
-          'Owner browser session; mutating requests also require Origin equal to APP_ORIGIN. New grants, approving an access request, saving a connection, backup export, restore and recipient changes additionally require a login within the last 10 minutes.',
+          'Owner browser session; mutating requests also require Origin equal to APP_ORIGIN. New grants, approving an access request, saving a connection, backup export and recipient changes additionally require a login within the last 10 minutes.',
       },
       AgentBearer: {
         type: 'http',

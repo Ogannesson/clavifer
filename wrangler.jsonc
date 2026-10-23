@@ -1,9 +1,12 @@
-// Template. The top level is the local development configuration and works as it is. Before
-// deploying an environment, replace its example.com hostname and its zeroed database_id with
-// your own, and create the D1 database and R2 bucket it names.
+// Template. The top level is the local development configuration and works as it is
+// (npm run deploy -- --local). Before deploying an environment, replace the zeroed account_id with
+// your account, the environment's example.com hostname and zeroed database_id with your own, and
+// create the D1 database and R2 bucket it names; then npm run deploy -- --env <name>. Until then
+// the zeroed account makes every wrangler command against this file fail.
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "clavifer",
+  "account_id": "00000000000000000000000000000000",
   "main": "apps/worker/src/index.ts",
   "compatibility_date": "2026-09-11",
   "compatibility_flags": ["nodejs_compat"],
@@ -11,14 +14,14 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "clavifer",
+      "database_name": "clavifer-local",
       "migrations_dir": "migrations",
     },
   ],
   "r2_buckets": [
     {
       "binding": "BACKUPS",
-      "bucket_name": "clavifer-backups",
+      "bucket_name": "clavifer-backups-local",
     },
   ],
   "assets": {
@@ -45,6 +48,7 @@
     "staging": {
       "name": "clavifer-staging",
       "workers_dev": false,
+      "preview_urls": false,
       "routes": [{ "pattern": "credentials-staging.example.com", "custom_domain": true }],
       "vars": {
         "APP_ORIGIN": "https://credentials-staging.example.com",
@@ -67,10 +71,14 @@
       "triggers": {
         "crons": ["*/15 * * * *"],
       },
+      "secrets": {
+        "required": ["ROOT_KEY"],
+      },
     },
     "production": {
       "name": "clavifer-production",
       "workers_dev": false,
+      "preview_urls": false,
       "routes": [{ "pattern": "credentials.example.com", "custom_domain": true }],
       "vars": {
         "APP_ORIGIN": "https://credentials.example.com",
@@ -92,6 +100,9 @@
       ],
       "triggers": {
         "crons": ["*/15 * * * *"],
+      },
+      "secrets": {
+        "required": ["ROOT_KEY"],
       },
     },
   },

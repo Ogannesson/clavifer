@@ -117,6 +117,8 @@ export type BackupStatus = {
   lastAttemptAt: number | null;
   lastError: string | null;
   retentionError: string | null;
+  archiveError: string | null;
+  unsealedBytes: number;
   pending: boolean;
   running: boolean;
   downloadAvailable: boolean;
@@ -146,13 +148,17 @@ const errorText: Record<string, string> = {
   request_failed: '服务返回了无法识别的响应，请稍后重试或查看服务日志。',
   owner_auth_required: '请先登录管理员账户。',
   origin_not_allowed: '请求来源不受信任，请从本站重新打开页面。',
-  invalid_bootstrap_token: '初始化令牌不正确。',
-  bootstrap_already_used: '本服务已经创建过管理员，请直接登录。',
-  bootstrap_in_progress: '另一处正在初始化管理员，请稍后刷新。',
+  cross_site_request: '完整导出只能从本站的备份页面发起，来自其他网站或直接打开的链接已被拒绝。',
+  invalid_bootstrap_token: '令牌不正确、已过期或已经用过，请重新签发一个。',
+  already_initialized: '本服务已经有管理员，请直接登录；忘记密码时用找回令牌重置。',
+  not_initialized: '本服务还没有管理员，这个令牌只能用来创建管理员或导入快照。',
+  invalid_snapshot: '快照文件不符合格式，无法导入。',
+  snapshot_inconsistent: '快照里的记录互相对不上（例如授权指向快照里没有的安装实例），无法导入。',
+  import_incomplete: '收到的记录数与快照末尾的计数不一致，可能漏传了一部分，导入没有完成。请重新签发令牌后再导入一次。',
+  import_superseded: '这次导入已失效：实例已经初始化，或者有人用新令牌重新开始了导入。',
   version_conflict: '此凭据已被更新，请刷新后重新轮换。',
   insufficient_scope: '当前没有这项资源的使用权限。',
   existing_grant_conflict: '该资源已有字段范围不同的有效授权。请先在授权表单手工调整该授权，再批准或拒绝此申请。',
-  restore_requires_empty_vault: '恢复只能在空凭据库中进行。',
   use_path_prefix_not_glob: '路径请输入 /v1 这样的前缀，不使用星号。',
   invalid_rule:
     '格式不正确：每行写「方法 路径」或只写路径，方法为 GET、POST 等或 *，路径以 / 开头，不含 ; 和控制字符，只能在末尾写 /* 表示含子路径，例如 DELETE /v1/items/*。',
@@ -178,7 +184,6 @@ const errorText: Record<string, string> = {
   origin_mismatch: '页面已过期或地址不一致，请刷新后重试。',
   secret_name_taken:
     '凭据名称已被占用（已删除的凭据也占着名称），这份草案无法批准。请拒绝它，让 Agent 换个名字重新提交。',
-  duplicate_secret: '已存在同名凭据，请换一个名称。',
   conflict: '存在同名或重复的记录，请换一个名称。',
   endpoint_disabled: '此接口在本服务中已关闭。',
   body_too_large: '提交的内容超出大小限制。',
@@ -186,11 +191,22 @@ const errorText: Record<string, string> = {
   invalid_backup_recipient: 'age 公钥格式不正确。请填写公钥接收者，不能填写私钥。',
   backup_not_found: '还没有可下载的备份。',
   backup_failed: '备份暂未成功，稍后会重试；请保留已有备份。',
-  backup_has_broken_connection: '存在失效的凭据绑定，请修复或删除对应 API 连接后再备份。',
-  backup_limit_exceeded: '凭据或连接数量超出单次备份上限（各 500 条 / 8 MiB）。',
+  // A snapshot of an inconsistent instance is refused whole: the automatic backup and the full export alike.
+  backup_has_broken_connection:
+    '有 API 连接绑定的凭据不存在或缺少所需字段。修复或删除这个连接之前，自动备份和完整导出都会被拒绝，不写出任何内容。',
+  backup_has_missing_versions: '有凭据缺少历史版本。在修复之前，自动备份和完整导出都会被拒绝，不写出任何内容。',
+  backup_has_dangling_reference:
+    '有授权或访问申请指向已不存在的安装实例或资源。在修复之前，自动备份和完整导出都会被拒绝，不写出任何内容。',
+  backup_unrepresentable:
+    '有记录不符合快照格式（例如早期版本留下的设置）。在修复之前，自动备份和完整导出都会被拒绝，不写出任何内容。',
+  archive_identity_missing:
+    '数据库里缺少归档身份（创建 Owner 时生成），没有它就读不出已封存的冷数据。自动备份和完整导出都会被拒绝，不写出任何内容。',
+  archive_segment_unavailable:
+    '存储桶里缺少一个已封存的冷数据文件，或它的校验和与记录不符，完整导出已取消，没有写出任何内容。',
   backup_storage_failed: '加密副本写入存储失败，请稍后重试。',
   backup_state_unavailable: '备份状态暂时不可读，请稍后重试。',
-  backup_decrypt_failed: '无法解密：请确认选择的是 .age 备份文件，并填写与之对应的 age 私钥。',
+  hot_data_over_limit:
+    '热数据超限：尚未封存的数据超过 9 MB，本次自动备份已跳过。旧的审计和访问申请封存后会自动恢复；如果凭据和连接本身就这么多，请改用完整导出。',
   internal_error: '操作失败。请查看服务日志中的请求编号。',
   too_many_requests: '操作过于频繁，请稍后再试。',
   network_error: '无法连接服务，请检查网络后重试。',
@@ -222,6 +238,18 @@ export class Fault extends Error {
 }
 // Upstream English messages are never shown; an unmapped code still names itself for troubleshooting.
 export const fault = (code: string) => new Fault(code, errorText[code] ?? `操作失败（${code}）。`);
+// What stopped sealing, which moves old audit rows and access requests out of the hot tables. Until it
+// runs again they stay there, so the hot data keeps growing.
+const archiveErrorText: Record<string, string> = {
+  archive_failed: '读写存储或数据库时出错，下一次计划任务会重试。',
+  archive_conflict:
+    '要封存的一段记录在读出之后又多出了行，这不应发生；本次没有封存，下一次计划任务会重新读取。反复出现时请查看服务日志。',
+  backup_unrepresentable: '有旧的审计或访问申请不符合封存格式，封存已停下，这些记录留在热表里。',
+  snapshot_line_too_long: '有一条旧记录超过单行长度上限，无法封存，封存已停下。',
+  encryption_key_missing: '归档身份无法用当前根密钥解开，无法封存。',
+  archive_identity_missing: '数据库里缺少归档身份（创建 Owner 时生成），无法封存。',
+};
+export const archiveErrorMessage = (code: string) => archiveErrorText[code] ?? `封存失败（${code}）。`;
 // Better Auth answers a rate limit with a bare 429 that carries no code.
 const failure = (status: number, code: unknown) =>
   fault(String(code ?? (status === 429 ? 'too_many_requests' : 'request_failed')));
@@ -253,6 +281,9 @@ export async function api(path: string, method = 'GET', body?: unknown, headers:
       e.message = `「${ruleKindText[at[1]]}」规则${at[2] ? `第 ${at[2]} 条` : ''}${e.message}`;
     const host = String(value.hint ?? '').match(/^hosts line (\d+)$/);
     if (host && e.code === 'invalid_host') e.message = `「额外域名」第 ${host[1]} 条${e.message}`;
+    // Which record of a refused snapshot is wrong, as the service names it.
+    if (value.hint && ['invalid_snapshot', 'snapshot_inconsistent', 'import_incomplete'].includes(e.code))
+      e.message += `（${String(value.hint)}）`;
     throw e;
   }
   return value;
@@ -262,25 +293,23 @@ export const ruleKindText: Record<string, string> = { deny: '拒绝', approval: 
 export const hostedSuffixText =
   '不要登记公共托管后缀，如 *.workers.dev、*.blob.core.windows.net、*.github.io：这些后缀下任何人都能注册子域名。';
 
-/** The encrypted export is a binary download, so it cannot go through the JSON helper. */
-export async function downloadExport(recipient: string) {
-  const r = await send('/admin/backup/export', {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ recipient }),
-  });
-  if (!r.ok) {
-    const json = r.headers.get('content-type')?.split(';')[0] === 'application/json';
-    throw fault(json ? String(((await r.json()) as { error?: string }).error ?? 'request_failed') : 'request_failed');
-  }
-  const url = URL.createObjectURL(await r.blob());
+/** The full export streams straight to disk through a link download, which neither holds the file in
+ * the page nor tells it when the download ends. The random id it carries names the export in the
+ * audit, where the server records that it wrote the last byte; returns that id. */
+export function startFullExport(recipient: string) {
+  // The recipient goes into the address, so a private key pasted by mistake must never get that far.
+  if (!/^age1[0-9a-z]+$/.test(recipient)) throw fault('invalid_backup_recipient');
+  const id = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
   const a = document.createElement('a');
-  a.href = url;
-  a.download = `clavifer-${new Date().toISOString().slice(0, 10)}.age`;
+  a.href = `/admin/backup/export?${new URLSearchParams({ recipient, id })}`;
+  a.download = '';
   a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return id;
 }
+export type ExportStatus = { status: 'complete' | 'started' | 'unknown' | 'failed'; error?: string };
 
 export const METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'] as const;
 /** Forms stay uncontrolled; values are read from FormData on submit. */

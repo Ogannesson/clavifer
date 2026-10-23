@@ -1,20 +1,19 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Miniflare, convertV4MiniflareOptions, Log, LogLevel } from 'miniflare';
+import { generateIdentity, identityToRecipient } from 'age-encryption';
 import { applyMigrations } from '../scripts/migrations.mjs';
+import { issueSql, newToken } from '../scripts/bootstrap-token.mjs';
 import worker from '../apps/worker/src/index';
 import { type Bindings } from '../apps/worker/src/context';
 
 // Real D1 and the real routes, so deletion is observed through the same transaction the Worker runs.
 const origin = 'http://localhost:8787';
-const token = Buffer.from('bootstrap-token-for-tests').toString('base64url');
 const password = 'synthetic-password-for-tests';
 const context = { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext;
 let mf: Miniflare,
   env: Bindings,
   cookie = '';
 
-const digest = async (value: string) =>
-  Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))).toString('base64url');
 async function call(path: string, method = 'GET', body?: unknown, headers: Record<string, string> = {}) {
   const response = await worker.fetch(
     new Request(origin + path, {
@@ -60,24 +59,26 @@ beforeAll(async () => {
     DB: db,
     APP_ORIGIN: origin,
     ALLOW_LOCAL_HTTP: 'true',
-    AUTH_SECRET: 'synthetic-auth-secret-for-tests',
-    KEK_RING: `v1:${Buffer.from('s'.repeat(32)).toString('base64url')}`,
-    ACTIVE_KEK_ID: 'v1',
-    BOOTSTRAP_HASH: await digest(token),
+    ROOT_KEY: `1:${Buffer.from('s'.repeat(32)).toString('base64url')}`,
   } as unknown as Bindings;
-  expect(
-    (
-      await call(
-        '/bootstrap',
-        'POST',
-        { name: 'Owner', email: 'owner@example.com', password },
-        { 'x-bootstrap-token': token },
-      )
-    ).status,
-  ).toBe(201);
-  const login = await call('/api/auth/sign-in/email', 'POST', { email: 'owner@example.com', password });
-  expect(login.status).toBe(200);
-  cookie = login.headers
+  const { token, binds } = newToken();
+  await db
+    .prepare(issueSql)
+    .bind(...binds)
+    .run();
+  const setup = await call(
+    '/api/setup/owner',
+    'POST',
+    {
+      name: 'Owner',
+      email: 'owner@example.com',
+      password,
+      backupRecipient: await identityToRecipient(await generateIdentity()),
+    },
+    { 'x-bootstrap-token': token },
+  );
+  expect(setup.status).toBe(201);
+  cookie = setup.headers
     .getSetCookie()
     .map((value) => value.split(';')[0])
     .join('; ');

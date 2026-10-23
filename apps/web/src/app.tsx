@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { api, authFault, emptyStatus, Fault, type Status } from './api';
 import { auth, TABS, type AppApi, type Owner, type TabId } from './shell';
 import { Icon, Toasts, useConfirm, type Toast } from './ui';
-import { Bootstrap, ConsentPage, DevicePage, LoginPage, Reauth } from './entry';
+import { ConsentPage, DevicePage, LoginPage, Reauth, Setup } from './entry';
 import { Overview } from './pages/overview';
 import { Secrets } from './pages/secrets';
 import { Connections } from './pages/connections';
@@ -52,8 +52,7 @@ export function App() {
   }, []);
 
   const refresh = useCallback(async () => {
-    const setup = await api('/setup');
-    setInitialized(!!setup.initialized);
+    setInitialized(!!(await api('/healthz')).initialized);
     const session = await auth.getSession();
     const user = session.data?.user as { name: string; email: string } | undefined;
     setOwner(user ? { name: user.name, email: user.email } : null);
@@ -189,7 +188,9 @@ export function App() {
         {toastBar}
       </>
     );
-  if (!initialized) return <Bootstrap app={app} toasts={toastBar} />;
+  // An uninitialized instance has nothing but its setup page; an initialized one shows it at /setup,
+  // where a recovery token resets the Owner's login.
+  if (!initialized || location.pathname === '/setup') return <Setup app={app} toasts={toastBar} />;
   if (location.pathname === '/device') return <DevicePage app={app} toasts={toastBar} />;
   if (location.pathname === '/consent') return <ConsentPage app={app} toasts={toastBar} />;
   // /login only appears with an OAuth query behind it; without one a signed-in Owner belongs in the console.

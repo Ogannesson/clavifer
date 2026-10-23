@@ -1,6 +1,6 @@
 # Authentication
 
-Clavifer authenticates two kinds of callers, and they never share credentials. The Owner signs in to the web console with a password or a Passkey and gets a browser session. Each installation logs in through OAuth and gets tokens that are valid only for this server's `/v1` API. This page covers both, the one-time bootstrap token that creates the Owner, where the command line keeps its tokens, and what to redo after the service moves to another domain.
+Clavifer authenticates two kinds of callers, and they never share credentials. The Owner signs in to the web console with a password or a Passkey and gets a browser session. Each installation logs in through OAuth and gets tokens that are valid only for this server's `/v1` API. This page covers both, the one-time bootstrap token that creates the Owner or resets its password, where the command line keeps its tokens, and what to redo after the service moves to another domain.
 
 | Caller       | Proves identity with                                  | Used for                                      |
 | ------------ | ----------------------------------------------------- | --------------------------------------------- |
@@ -11,14 +11,19 @@ There is no third-party single sign-on, and there is exactly one Owner account.
 
 ## Bootstrap token
 
-A new deployment has no Owner. The first visit to the console shows the setup form, which calls `POST /bootstrap` with the bootstrap token in the `x-bootstrap-token` header and the Owner's name, email address, and password (12 to 128 characters).
+A new deployment has no Owner. The deployment issues a one-time bootstrap token and writes it to a file. The console's `/setup` page takes the token and sends it in the `x-bootstrap-token` header, and nowhere else. What the token does depends on the instance:
 
-- The server stores only `BOOTSTRAP_HASH`, the SHA-256 hash of the token. The token itself exists only where you generated it.
-- The token works once. After an Owner exists, every call to `/bootstrap` fails with `bootstrap_already_used`.
-- A wrong token fails with `invalid_bootstrap_token`.
-- Bootstrap is the only way to create an account. The auth library's sign-up endpoint is closed (`endpoint_disabled`), as are its endpoints for changing the email address and deleting the account.
+| Instance      | Token valid for | What `/setup` does with it                                                                                                                                                                                           |
+| ------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Uninitialized | 24 hours        | Creates the Owner from a name, an email address, a password (12 to 128 characters), and the age recipient for automatic backups. Or [imports a snapshot](security-model.md#backups) instead.                         |
+| Initialized   | 1 hour          | Sets a new Owner password. Every Passkey and every session of the Owner is removed. Installations, grants, and their logins stay.                                                                                   |
 
-Treat the token like a password until the Owner exists. Do not paste it into an agent conversation or a log. [deploy.md](deploy.md) generates the token and its hash as part of the deployment, in [Step A4](deploy.md#step-a4-generate-the-local-secrets) for a local trial and [Step 2.9](deploy.md#step-29-generate-the-worker-secrets) for production.
+- The database stores only the SHA-256 hash of the token and its expiry. The token itself exists only in the file the deployment wrote.
+- The token works once: the first statement of the batch that does the work spends it. Issuing a new token replaces any earlier one.
+- A wrong, expired, or spent token fails with `invalid_bootstrap_token`. Creating an Owner on an initialized instance fails with `already_initialized`, and resetting the password on an uninitialized one with `not_initialized`.
+- `/setup` is the only way to create an account. The auth library's sign-up endpoint is closed (`endpoint_disabled`), as are its endpoints for changing the email address and deleting the account, and its endpoints for creating, updating, and deleting OAuth clients: `/admin/clients` is the only way to create or revoke an installation.
+
+Treat the token like a password until it is spent. Do not paste it into an agent conversation or a log. [deploy.md](deploy.md) issues the token as part of a deployment, and issues a new one when the Owner needs to recover.
 
 ## Owner sign-in
 
@@ -29,7 +34,7 @@ The Owner signs in with email and password, or with a Passkey.
 - **Session.** A session lasts 24 hours and is extended while it is in use.
 - **Rate limit.** The auth endpoints under `/api/auth` are limited to 100 requests per 60 seconds, and the device code lookup to 30, counted by client IP address.
 
-There is no email recovery. Keep at least one working way to sign in, and register more than one Passkey. If the password and every Passkey are lost, the console offers no way back in: recovery takes direct access to the database through the Cloudflare account, and this repository ships no tool for it.
+There is no email recovery. Keep at least one working way to sign in, and register more than one Passkey. If the password and every Passkey are lost, whoever can deploy the service issues a new bootstrap token, and `/setup` sets a new password with it, as described [above](#bootstrap-token).
 
 ## Operations that need a recent sign-in
 
@@ -40,13 +45,12 @@ Some operations require that the Owner signed in within the last 10 minutes. The
 | Create a grant                                                                   | `POST /admin/grants`                                                                                                                                           |
 | Approve an access request                                                        | `POST /admin/access-requests/{id}/approve`                                                                                                                     |
 | Create or edit a connection                                                      | `POST /admin/connections`, `PUT /admin/connections/{id}`                                                                                                       |
-| Export a backup                                                                  | `POST /admin/backup/export`                                                                                                                                    |
-| Restore a backup                                                                 | `POST /admin/backup/restore`                                                                                                                                   |
+| Download a full export                                                           | `GET /admin/backup/export`                                                                                                                                     |
 | Set or clear the backup recipient                                                | `PUT /admin/backup/config`                                                                                                                                     |
 | Look up, approve, or deny a device code                                          | `/api/auth/device`, `/api/auth/device/approve`, `/api/auth/device/deny`                                                                                        |
 | Issue an OAuth authorization code                                                | `/api/auth/oauth2/authorize`, `/api/auth/oauth2/consent`, `/api/auth/oauth2/continue`                                                                          |
 | Register, rename, or delete a Passkey                                            | `/api/auth/passkey/generate-register-options`, `/api/auth/passkey/verify-registration`, `/api/auth/passkey/update-passkey`, `/api/auth/passkey/delete-passkey` |
-| Change an OAuth client or a stored consent through the auth library's own routes | The client and consent routes under `/api/auth/oauth2/`                                                                                                        |
+| Rotate a client secret or change a stored consent through the auth library's own routes | `/api/auth/oauth2/client/rotate-secret`, `/api/auth/oauth2/update-consent`, `/api/auth/oauth2/delete-consent`                                            |
 
 Every other write under `/admin/*` needs a signed-in Owner and a request from the service's own origin. That includes creating an installation, revoking an installation or a grant, creating, rotating, or deleting a secret, deleting a connection, denying an access request, and starting a backup run.
 
@@ -180,3 +184,5 @@ The service's origin is part of every token's audience, of each stored login, an
 3. **Authorize remote MCP clients again** at the new address.
 
 The server-side steps of the move are in [deploy.md](deploy.md#changing-the-hostname).
+
+The same holds after a snapshot is imported into a new instance. Installations keep their client IDs and grants, but no token travels in a snapshot: every profile logs in again, and remote MCP clients authorize again. Passkeys come across only when the new instance has the same hostname.

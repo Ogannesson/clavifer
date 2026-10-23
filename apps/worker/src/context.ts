@@ -4,30 +4,28 @@ import { drizzle } from 'drizzle-orm/d1';
 import { drizzleAdapter } from '@better-auth/drizzle-adapter';
 import { betterAuth } from 'better-auth/minimal';
 import { verifyJwsAccessToken } from 'better-auth/oauth2';
-import { authPlugins, additionalSessionFields, emailPassword } from '../../../packages/auth/policy';
+import { authPlugins, emailPassword } from '../../../packages/auth/policy';
 import * as schema from '../../../packages/auth/schema';
 import { Fault, assert } from '../../../packages/core/errors';
+import { parseRootKeys, deriveKey, rootKeyFingerprints, encode } from '../../../packages/core/crypto';
 
 export type Bindings = Env & {
-  AUTH_SECRET?: string;
-  KEK_RING?: string;
-  ACTIVE_KEK_ID?: string;
-  BOOTSTRAP_HASH?: string;
+  ROOT_KEY?: string;
 };
 export type Principal = { clientId: string; userId: string; scopes: string[] };
+export const VERSION = '0.5.0';
 export const now = () => Date.now();
 export const id = () => crypto.randomUUID();
 // Every audit row of one invocation carries the request id published in the
 // x-request-id response header, including rows written inside MCP tool calls.
 const currentRequestId = new AsyncLocalStorage<string>();
 export const withRequestId = <T>(value: string, fn: () => T) => currentRequestId.run(value, fn);
-// The Owner id and the Better Auth instance are immutable once bootstrap
-// completes, so an isolate resolves them once instead of per request.
+// For work that runs after the handler returned, such as the end of a streamed response.
+export const requestId = () => currentRequestId.getStore() ?? id();
+// The Owner id and the Better Auth instance are immutable once the Owner
+// exists, so an isolate resolves them once instead of per request.
 let owner = '';
-const authInstances = new Map<string, ReturnType<typeof buildAuth>>();
-export function cacheOwnerId(value: string) {
-  owner = value;
-}
+let authInstance: Awaited<ReturnType<typeof buildAuth>> | undefined;
 export async function ownerId(env: Bindings) {
   if (owner) return owner;
   return (owner =
@@ -37,31 +35,53 @@ export async function ownerId(env: Bindings) {
         .first<{ value: string }>()
     )?.value ?? '');
 }
-export function parseKeys(env: Bindings) {
-  return Object.fromEntries(
-    (env.KEK_RING ?? '')
-      .split(',')
-      .filter(Boolean)
-      .map((v) => v.split(':', 2)),
-  );
+export const rootKeys = (env: Bindings) => parseRootKeys(env.ROOT_KEY ?? '');
+// The database records the fingerprint of every root key in the ring when the Owner is created. A
+// Worker whose ring no longer matches them (the key was replaced, or the Worker is bound to another
+// instance's database) refuses everything but /healthz instead of writing data under a new key. A
+// match is final for the isolate; an uninitialized instance is checked again on every request, since
+// another isolate may complete the setup at any time.
+let keysMatched = false;
+export async function keyState(env: Bindings): Promise<'ok' | 'mismatch' | 'uninitialized'> {
+  if (keysMatched) return 'ok';
+  const rows = await env.DB.prepare(
+    "SELECT key,value FROM system_state WHERE key IN ('owner_user_id','root_key_fingerprints')",
+  ).all<{ key: string; value: string }>();
+  const state = Object.fromEntries(rows.results.map((r) => [r.key, r.value]));
+  if (!state.owner_user_id) return 'uninitialized';
+  const recorded: Record<string, string> = JSON.parse(state.root_key_fingerprints ?? '{}');
+  const ring = rootKeys(env);
+  const current = await rootKeyFingerprints(ring);
+  keysMatched =
+    Object.hasOwn(recorded, ring[0].id) && Object.entries(recorded).every(([kid, value]) => current[kid] === value);
+  return keysMatched ? 'ok' : 'mismatch';
 }
-export async function createAuth(env: Bindings, allowSignUp = false) {
-  assert(env.AUTH_SECRET, 'auth_secret_not_configured', 503);
+export async function createAuth(env: Bindings) {
+  if (authInstance) return authInstance;
   const oid = await ownerId(env);
-  const cached = oid ? authInstances.get(String(allowSignUp)) : undefined;
-  if (cached) return cached;
-  const auth = buildAuth(env, env.AUTH_SECRET, allowSignUp, oid);
-  if (oid) authInstances.set(String(allowSignUp), auth);
+  const auth = await buildAuth(env, oid);
+  // Every use of an instance awaits its one initialization, so one that failed would fail them all.
+  await auth.$context;
+  if (oid) authInstance = auth;
   return auth;
 }
-function buildAuth(env: Bindings, secret: string, allowSignUp: boolean, oid: string) {
+async function buildAuth(env: Bindings, oid: string) {
+  // One Better Auth secret per root key, the version being the key's id: cookies and signed queries use
+  // the current one, and the signing keys stay readable under every key still in the ring.
+  const secrets = await Promise.all(
+    rootKeys(env).map(async ({ id, key }) => ({
+      version: Number(id),
+      value: encode(await deriveKey(key, 'better-auth')),
+    })),
+  );
   return betterAuth({
     baseURL: env.APP_ORIGIN,
-    secret,
+    secrets,
     trustedOrigins: [env.APP_ORIGIN],
     database: drizzleAdapter(drizzle(env.DB), { provider: 'sqlite', camelCase: true, transaction: false, schema }),
-    session: { additionalFields: additionalSessionFields, expiresIn: 86400, updateAge: 3600 },
-    emailAndPassword: { ...emailPassword, disableSignUp: !allowSignUp },
+    session: { expiresIn: 86400, updateAge: 3600 },
+    // The Owner is written by /api/setup; nobody signs up.
+    emailAndPassword: { ...emailPassword, disableSignUp: true },
     // /device is Owner-only at the routing layer. Keep guessing protection on
     // public endpoints while allowing normal multi-device administration.
     rateLimit: {
@@ -130,32 +150,26 @@ export async function principal(request: Request, env: Bindings, required: strin
   return { clientId, userId, scopes };
 }
 /** An audit row as a statement, for a batch that writes it together with what it records. where (a
- * WHERE clause and its arguments) writes the row only when it holds, as the batch's other writes do. */
+ * WHERE clause and its arguments) writes the row only when it holds, as the batch's other writes do.
+ * owner is given only by the batch that creates the Owner, before anything records it. */
 export async function auditStatement(
   env: Bindings,
   actor: string,
   action: string,
   resource: string | null,
-  result = 'ok',
-  where = '',
-  args: unknown[] = [],
+  {
+    result = 'ok',
+    where = '',
+    args = [],
+    owner,
+  }: { result?: string; where?: string; args?: unknown[]; owner?: string } = {},
 ) {
   return env.DB.prepare(
     `INSERT INTO audit_events (id,owner_id,client_id,action,resource_id,result,request_id,created_at) SELECT ?,?,?,?,?,?,?,? ${where}`,
-  ).bind(
-    id(),
-    await ownerId(env),
-    actor,
-    action,
-    resource,
-    result,
-    currentRequestId.getStore() ?? id(),
-    now(),
-    ...args,
-  );
+  ).bind(id(), owner ?? (await ownerId(env)), actor, action, resource, result, requestId(), now(), ...args);
 }
 export async function audit(env: Bindings, actor: string, action: string, resource: string | null, result = 'ok') {
-  return (await auditStatement(env, actor, action, resource, result)).run();
+  return (await auditStatement(env, actor, action, resource, { result })).run();
 }
 export async function boundedBytes(stream: ReadableStream<Uint8Array> | null, max = 1024 * 1024) {
   if (!stream) return new Uint8Array();

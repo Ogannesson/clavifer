@@ -1,7 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Miniflare, convertV4MiniflareOptions, Log, LogLevel } from 'miniflare';
 import { ZodError } from 'zod';
+import { generateIdentity, identityToRecipient } from 'age-encryption';
 import { applyMigrations } from '../scripts/migrations.mjs';
+import { issueSql, newToken } from '../scripts/bootstrap-token.mjs';
 import worker from '../apps/worker/src/index';
 import { accessRequest, accessStatus, boundSecret, invoke, invokeInput } from '../apps/worker/src/vault';
 import { type Bindings, type Principal, issuesHint } from '../apps/worker/src/context';
@@ -9,7 +11,6 @@ import { type Bindings, type Principal, issuesHint } from '../apps/worker/src/co
 // Real D1 and the real approval route, so a setup's credential, connection and approval are observed
 // as one batch and its values pass through the same encryption as the Owner's own form.
 const origin = 'http://localhost:8787';
-const token = Buffer.from('bootstrap-token-for-proposals').toString('base64url');
 const password = 'synthetic-password-for-proposals';
 const context = { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext;
 let mf: Miniflare,
@@ -18,8 +19,6 @@ let mf: Miniflare,
   agent: Principal;
 const upstream = vi.fn(async (_url: unknown, _init?: RequestInit) => new Response('ok'));
 
-const digest = async (value: string) =>
-  Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))).toString('base64url');
 async function call(path: string, method = 'GET', body?: unknown, bindings = env) {
   const response = await worker.fetch(
     new Request(origin + path, {
@@ -56,32 +55,34 @@ beforeAll(async () => {
     DB: db,
     APP_ORIGIN: origin,
     ALLOW_LOCAL_HTTP: 'true',
-    AUTH_SECRET: 'synthetic-auth-secret-for-proposals',
-    KEK_RING: `v1:${Buffer.from('p'.repeat(32)).toString('base64url')}`,
-    ACTIVE_KEK_ID: 'v1',
-    BOOTSTRAP_HASH: await digest(token),
+    ROOT_KEY: `1:${Buffer.from('p'.repeat(32)).toString('base64url')}`,
   } as unknown as Bindings;
-  const bootstrap = await worker.fetch(
-    new Request(origin + '/bootstrap', {
+  const { token, binds } = newToken();
+  await db
+    .prepare(issueSql)
+    .bind(...binds)
+    .run();
+  const setup = await worker.fetch(
+    new Request(origin + '/api/setup/owner', {
       method: 'POST',
-      headers: { origin, 'content-type': 'application/json', 'x-bootstrap-token': token },
-      body: JSON.stringify({ name: 'Owner', email: 'owner@example.com', password }),
+      headers: {
+        origin,
+        'cf-connecting-ip': '127.0.0.1',
+        'content-type': 'application/json',
+        'x-bootstrap-token': token,
+      },
+      body: JSON.stringify({
+        name: 'Owner',
+        email: 'owner@example.com',
+        password,
+        backupRecipient: await identityToRecipient(await generateIdentity()),
+      }),
     }),
     env,
     context,
   );
-  expect(bootstrap.status).toBe(201);
-  const login = await worker.fetch(
-    new Request(origin + '/api/auth/sign-in/email', {
-      method: 'POST',
-      headers: { origin, 'cf-connecting-ip': '127.0.0.1', 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'owner@example.com', password }),
-    }),
-    env,
-    context,
-  );
-  expect(login.status).toBe(200);
-  cookie = login.headers
+  expect(setup.status).toBe(201);
+  cookie = setup.headers
     .getSetCookie()
     .map((value) => value.split(';')[0])
     .join('; ');
@@ -816,6 +817,111 @@ describe('the pending requests of one installation', () => {
       .bind(Date.now() - 1, rids[0])
       .run();
     expect(await ask(p, draft())).toBeTruthy();
+  });
+
+  // Invocations of their own connection, whose bodies are control characters: six bytes each once JSON
+  // escapes them.
+  const invocations = async () => {
+    const cid = String(
+      (
+        await call('/admin/connections', 'POST', {
+          name: `Escapes ${++serial}`,
+          origin: 'https://api.vendor.example',
+          paths: ['/v1'],
+          methods: ['POST'],
+          auth: { type: 'none' },
+        })
+      ).body.id,
+    );
+    return (p: Principal, characters: number, path = '/v1/items') =>
+      accessRequest(
+        env,
+        p,
+        {
+          requested: { invocation: { connection: cid, method: 'POST', path, body: '\u0001'.repeat(characters) } },
+          reason: 'r',
+        },
+        origin,
+      );
+  };
+  // A setup of three connections of one credential, their tests padded with `fillers` tests of a path out
+  // of scope (1000 times char; '中' takes three bytes, unescaped) and one whose path is `last` longer.
+  const out = (path: string) => ({ method: 'GET', path, grant: true, expect: 'path_not_allowed' });
+  const padded = (fillers: number, { last = 0, char = 'x', base = draft() } = {}) => {
+    const [c] = base.connections;
+    return {
+      ...base,
+      connections: [0, 1, 2].map((i) => ({
+        ...c,
+        name: `${c.name} ${i}`,
+        tests: [
+          ...c.tests,
+          ...Array.from({ length: Math.max(0, Math.min(90, fillers - 90 * i)) }, () => out('/v2/' + char.repeat(1000))),
+          ...(i === 0 ? [out('/v2/y' + 'y'.repeat(last))] : []),
+        ],
+      })),
+    };
+  };
+  const propose = (p: Principal, setup: ReturnType<typeof padded>) =>
+    accessRequest(env, p, { requested: { setup }, reason: 'r' }, origin);
+
+  it('take at most 256 KiB each, counted in bytes as stored after escaping', async () => {
+    const send = await invocations();
+    // 64 KiB of body, the most an invocation carries, is about 393 KB as stored.
+    const p = installation();
+    const refused = await send(p, 65536).catch((e: unknown) => e);
+    expect(refused).toMatchObject({ code: 'request_too_large', status: 413 });
+    expect((refused as Error).message).toContain('as stored');
+    // 90 tests of 1000 Chinese characters: about 276 KB in about 92,000 characters.
+    await expect(propose(p, padded(90, { char: '中' }))).rejects.toMatchObject({ code: 'request_too_large' });
+    expect(await pending(p)).toEqual([]);
+    // 43,000 control characters store as about 258 KB; 80 Chinese tests as about 249 KB.
+    const ids = [(await send(p, 43000)).id, (await propose(p, padded(80, { char: '中' }))).id];
+    expect(await pending(p)).toEqual(ids.sort());
+  });
+
+  it('take at most 256 KiB each with the ids a setup is given', async () => {
+    const p = installation();
+    const base = draft();
+    const submit = (fillers: number, last: number) => propose(p, padded(fillers, { last, base }));
+    // The stored size, read back as written, and the part of it the ids take.
+    const stored = async (fillers: number, last: number) => {
+      const { requested_json } = (await env.DB.prepare('SELECT requested_json FROM access_requests WHERE id=?')
+        .bind((await submit(fillers, last)).id)
+        .first<{ requested_json: string }>())!;
+      return {
+        size: Buffer.byteLength(requested_json) + 1,
+        ids: requested_json.length - requested_json.indexOf(',"ids":'),
+      };
+    };
+    const empty = await stored(0, 10);
+    const filler = (await stored(1, 10)).size - empty.size;
+    // The fillers and last path that make the stored size 262,145 bytes, one more than the limit.
+    const target = 256 * 1024 + 1;
+    const fillers = Math.floor((target - empty.size) / filler);
+    const last = 10 + target - empty.size - fillers * filler;
+    expect(empty.ids).toBeGreaterThan(100);
+    // Without the ids it would fit; with them it does not, and one byte less does.
+    await expect(submit(fillers, last)).rejects.toMatchObject({ code: 'request_too_large' });
+    expect((await stored(fillers, last - 1)).size).toBe(target - 1);
+  });
+
+  it('stop at 1 MiB in bytes as stored, whatever their number', async () => {
+    const send = await invocations();
+    const p = installation();
+    for (const i of [1, 2, 3, 4]) await send(p, 43000, `/v1/items/${i}`);
+    const refused = await send(p, 43000, '/v1/items/5').catch((e: unknown) => e);
+    expect(refused).toMatchObject({ code: 'too_many_pending', status: 429 });
+    expect((refused as Error).message).toContain('over 1 MiB');
+    expect((refused as Error).message).toContain('a smaller request may still fit');
+    // A small one still fits, and another installation is counted on its own.
+    expect((await send(p, 10, '/v1/items/6')).id).toBeTruthy();
+    expect((await send(installation(), 43000, '/v1/items/5')).id).toBeTruthy();
+    // Chinese text: four setups of about 249 KB wait, in about 0.34 million characters; a fifth would
+    // bring them over 1 MiB in bytes.
+    const q = installation();
+    for (let i = 0; i < 4; i++) await propose(q, padded(80, { char: '中' }));
+    await expect(propose(q, padded(80, { char: '中' }))).rejects.toMatchObject({ code: 'too_many_pending' });
   });
 
   it('are denied when the Owner revokes it, and leave the list the Owner decides from', async () => {

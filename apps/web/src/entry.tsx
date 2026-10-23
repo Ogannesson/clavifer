@@ -1,5 +1,6 @@
 import { useRef, useState, type FormEvent, type ReactNode } from 'react';
-import { api, authFault, fv } from './api';
+import { Fault, api, authFault, fault, fv, lines } from './api';
+import type { Segment } from './import';
 import { auth, type AppApi } from './shell';
 import { Field, Icon, useOverlay } from './ui';
 
@@ -51,35 +52,293 @@ const submit = (app: AppApi, handler: (f: FormData) => Promise<void>, success?: 
   void app.run(() => handler(new FormData(form)), success);
 };
 
-export function Bootstrap({ app, toasts }: { app: AppApi; toasts: ReactNode }) {
+/** What the page learned from the token: an uninitialized instance takes a new Owner, an initialized one
+ * a new password for the Owner signing in with email. */
+type SetupStep = { token: string; initialized: false } | { token: string; initialized: true; email: string };
+/** Leaves /setup for the console, which then shows the console or the login page. */
+const leaveSetup = async (app: AppApi) => {
+  history.replaceState(null, '', '/');
+  await app.refresh();
+};
+
+/** /setup, entered with the one-time token the deployment wrote to a file. */
+export function Setup({ app, toasts }: { app: AppApi; toasts: ReactNode }) {
+  const [step, setStep] = useState<SetupStep | null>(null);
+  if (!step)
+    return (
+      <EntryCard
+        title="设置管理员"
+        description="输入部署时签发的一次性令牌：新实例用它创建管理员或导入快照，已有管理员的实例用它重置管理员的登录。令牌只在本机文件里，不要把它粘贴到 Agent 对话或日志中。"
+        toasts={toasts}
+      >
+        <form
+          onSubmit={submit(
+            app,
+            async (f) => {
+              const token = fv(f, 'token').trim();
+              setStep({
+                token,
+                ...(await api('/api/setup/token', 'POST', undefined, { 'x-bootstrap-token': token })),
+              } as SetupStep);
+            },
+            '',
+          )}
+        >
+          <Field label="一次性令牌">
+            <input name="token" type="password" autoComplete="off" required />
+          </Field>
+          <button className="btn btn--block" disabled={app.busy}>
+            继续
+          </button>
+        </form>
+      </EntryCard>
+    );
+  if (step.initialized)
+    return (
+      <EntryCard
+        title="重置管理员登录"
+        description="设置新密码后，用下面的邮箱登录。已登记的 Passkey 和所有网页登录都会失效，登录后可重新登记 Passkey；安装实例和授权不受影响。导入一份在重置之前做的快照，会把旧密码一起带回来。"
+        toasts={toasts}
+      >
+        <div className="review">
+          <dl>
+            <dt>登录邮箱</dt>
+            <dd>{step.email}</dd>
+          </dl>
+        </div>
+        <form
+          onSubmit={submit(
+            app,
+            async (f) => {
+              await api(
+                '/api/setup/password',
+                'POST',
+                { password: fv(f, 'password') },
+                { 'x-bootstrap-token': step.token },
+              );
+              await leaveSetup(app);
+            },
+            '密码已重置，请用新密码登录。',
+          )}
+        >
+          <Field label="新密码" hint="至少 12 位。请存入你自己的密码管理器。">
+            <input name="password" type="password" autoComplete="new-password" minLength={12} required />
+          </Field>
+          <button className="btn btn--block" disabled={app.busy}>
+            重置密码
+          </button>
+        </form>
+      </EntryCard>
+    );
+  return <Initialize app={app} toasts={toasts} token={step.token} />;
+}
+
+/** An uninitialized instance gets its Owner either new or with everything else from a snapshot. */
+function Initialize({ app, toasts, token }: { app: AppApi; toasts: ReactNode; token: string }) {
+  const [importing, setImporting] = useState(false);
+  const other = (
+    <div className="entry-alt">
+      <button
+        type="button"
+        className="btn btn--ghost btn--block"
+        disabled={app.busy}
+        onClick={() => setImporting(!importing)}
+      >
+        {importing ? '改为新建管理员' : '从快照导入（迁移或灾备恢复）'}
+      </button>
+    </div>
+  );
+  return importing ? (
+    <ImportSnapshot app={app} toasts={toasts} token={token} other={other} />
+  ) : (
+    <CreateOwner app={app} toasts={toasts} token={token} other={other} />
+  );
+}
+
+type Missing = { segments: Segment[]; decide: (go: boolean) => void };
+function ImportSnapshot({
+  app,
+  toasts,
+  token,
+  other,
+}: {
+  app: AppApi;
+  toasts: ReactNode;
+  token: string;
+  other: ReactNode;
+}) {
+  const [progress, setProgress] = useState<number | null>(null);
+  const [missing, setMissing] = useState<Missing | null>(null);
+  const start = async (f: FormData) => {
+    const file = f.get('file') as File;
+    const identity = lines(fv(f, 'identity')).find((line) => line.startsWith('AGE-SECRET-KEY-'));
+    if (!identity) throw new Error('请粘贴以 AGE-SECRET-KEY- 开头的 age 私钥。');
+    // Decryption and the format checks are a separate chunk; failing to load it is a connection problem.
+    const { importSnapshot } = await import('./import').catch(() => {
+      throw fault('network_error');
+    });
+    let read = 0;
+    const counted = file.stream().pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(bytes, controller) {
+          read += bytes.length;
+          setProgress(read / file.size);
+          controller.enqueue(bytes);
+        },
+      }),
+    );
+    let header;
+    try {
+      header = await importSnapshot({
+        file: counted,
+        identity,
+        token,
+        send: (path, body, headers) => api(path, 'POST', body, headers),
+        missing: (segments) =>
+          new Promise((resolve) =>
+            setMissing({
+              segments,
+              decide: (go) => {
+                setMissing(null);
+                resolve(go);
+              },
+            }),
+          ),
+      });
+    } catch (e) {
+      if (e instanceof Fault) throw e;
+      // The format module names what is wrong with the file; age only says that it cannot decrypt it.
+      const code = (e as { code?: unknown }).code;
+      throw typeof code === 'string'
+        ? new Error(`${fault(code).message}（${(e as Error).message}）`)
+        : new Error('无法解密这个文件：私钥与它不匹配，或文件不完整。');
+    } finally {
+      setProgress(null);
+    }
+    if (!header) throw new Error('导入已中止，实例仍未初始化。重新签发令牌后可以再导入一次。');
+    await leaveSetup(app);
+    app.notify(
+      header.source.rpId === location.hostname
+        ? '导入完成。请用原来的邮箱和密码或 Passkey 登录。'
+        : '导入完成。请用原来的邮箱和密码登录；Passkey 属于原来的域名，没有导入，登录后可重新登记。',
+    );
+  };
+  return (
+    <EntryCard
+      title="从快照导入"
+      description="把一份快照的全部内容导入这个新实例：管理员、凭据及全部版本、连接、安装实例、授权、访问申请和审计。文件在浏览器里解密，私钥不会发送出去。"
+      toasts={toasts}
+    >
+      {missing ? (
+        <div className="alert alert--warn">
+          <span className="alert-icon">
+            <Icon name="alert" size={18} />
+          </span>
+          <div className="alert-body">
+            <strong>存储桶里缺少 {missing.segments.length} 个已封存的冷数据分段</strong>
+            <p>
+              这份自动备份引用的分段不在这个实例的存储桶里，或校验和不符：
+              {missing.segments.map((s) => `${s.kind === 'audit' ? '审计' : '访问申请'} 第 ${s.seq} 段`).join('、')}
+              。不带它们继续，这些封存的记录就不会出现在新实例里，导入记录会写明跳过了哪些。
+            </p>
+            <div className="alert-actions">
+              <button type="button" className="btn btn--small btn--ghost" onClick={() => missing.decide(false)}>
+                中止导入
+              </button>
+              <button type="button" className="btn btn--small" onClick={() => missing.decide(true)}>
+                不带这些分段继续
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      <form onSubmit={submit(app, start, '')}>
+        <Field label="快照文件" hint="完整导出，或与这个实例共用存储桶的自动备份（.age）。">
+          <input name="file" type="file" accept=".age" required />
+        </Field>
+        <Field label="备份私钥" hint="快照加密给的 age 公钥对应的私钥，以 AGE-SECRET-KEY- 开头。">
+          <textarea name="identity" autoComplete="off" spellCheck={false} required />
+        </Field>
+        <p className="note">
+          导入后用原来的邮箱和密码登录。各宿主要用原来的 client ID 重新登录一次（网页类客户端重新授权一次）。Passkey
+          只在域名与原实例相同时导入，否则登录后重新登记。中途失败时实例保持未初始化，重新签发令牌后从头再导入。
+        </p>
+        {progress === null ? null : <progress value={progress} max={1} />}
+        <button className="btn btn--block" disabled={app.busy}>
+          {progress === null ? '开始导入' : `正在导入 ${Math.floor(progress * 100)}%`}
+        </button>
+      </form>
+      {other}
+    </EntryCard>
+  );
+}
+
+function CreateOwner({
+  app,
+  toasts,
+  token,
+  other,
+}: {
+  app: AppApi;
+  toasts: ReactNode;
+  token: string;
+  other: ReactNode;
+}) {
+  const [recipient, setRecipient] = useState('');
+  // The private half of a key pair generated here, until the Owner types another recipient.
+  const [identity, setIdentity] = useState('');
+  const generate = () =>
+    void app.run(async () => {
+      // The age library is a separate chunk; failing to load it is a connection problem.
+      const age = await import('age-encryption').catch(() => {
+        throw fault('network_error');
+      });
+      const key = await age.generateIdentity();
+      setIdentity(key);
+      setRecipient(await age.identityToRecipient(key));
+    }, '');
+  // The file reads like one age-keygen writes: creation time (RFC 3339) and public key as comments.
+  const download = () => {
+    const created = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const file = `# created: ${created}\n# public key: ${recipient}\n${identity}\n`;
+    const url = URL.createObjectURL(new Blob([file], { type: 'text/plain' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'clavifer-backup-key.txt';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
   return (
     <EntryCard
       title="创建管理员"
-      description="本服务只有一个管理员。请在本机打开初始化文件读取令牌，不要把它粘贴到 Agent 对话或日志中。"
+      description="本服务只有一个管理员。自动备份会加密给你填写的 age 公钥，私钥由你保管在 Cloudflare 之外。"
       toasts={toasts}
     >
       <form
         onSubmit={submit(
           app,
           async (f) => {
-            const email = fv(f, 'email');
-            const password = fv(f, 'password');
-            await api(
-              '/bootstrap',
-              'POST',
-              { name: fv(f, 'name'), email, password },
-              { 'x-bootstrap-token': fv(f, 'token') },
-            );
-            const r = await auth.signIn.email({ email, password });
-            if (r.error) throw authFault(r.error);
-            await app.refresh();
+            // Even a failed request may have created the Owner (only the sign-in after it failed); the
+            // refresh then shows the login page instead of this form with a spent token.
+            try {
+              await api(
+                '/api/setup/owner',
+                'POST',
+                {
+                  name: fv(f, 'name'),
+                  email: fv(f, 'email'),
+                  password: fv(f, 'password'),
+                  backupRecipient: recipient.trim(),
+                },
+                { 'x-bootstrap-token': token },
+              );
+            } finally {
+              await leaveSetup(app);
+            }
           },
           '管理员已创建，已为你登录。',
         )}
       >
-        <Field label="初始化令牌" hint="位于本机 work/local-bootstrap.token 或部署时保存的位置。">
-          <input name="token" type="password" autoComplete="off" required />
-        </Field>
         <Field label="姓名">
           <input name="name" autoComplete="name" required />
         </Field>
@@ -89,10 +348,43 @@ export function Bootstrap({ app, toasts }: { app: AppApi; toasts: ReactNode }) {
         <Field label="新密码" hint="至少 12 位。没有邮件找回，请存入你自己的密码管理器。">
           <input name="password" type="password" autoComplete="new-password" minLength={12} required />
         </Field>
+        <Field label="备份公钥" hint="以 age1 开头的 age 公钥。没有的话，可以在浏览器里生成一对。">
+          <input
+            name="backupRecipient"
+            autoComplete="off"
+            placeholder="age1…"
+            required
+            value={recipient}
+            onChange={(e) => {
+              setRecipient(e.target.value);
+              setIdentity('');
+            }}
+          />
+        </Field>
+        {/* Spaced like a field, so the buttons below do not run together. */}
+        <div className="field">
+          {identity ? (
+            <>
+              <button type="button" className="btn btn--ghost btn--block" onClick={download}>
+                <Icon name="download" size={15} />
+                下载私钥
+              </button>
+              <label className="check">
+                <input type="checkbox" required />
+                <span>私钥已保存到 Cloudflare 之外的地方。没有它，任何备份都无法解密。</span>
+              </label>
+            </>
+          ) : (
+            <button type="button" className="btn btn--ghost btn--block" disabled={app.busy} onClick={generate}>
+              在浏览器里生成密钥对
+            </button>
+          )}
+        </div>
         <button className="btn btn--block" disabled={app.busy}>
           创建管理员
         </button>
       </form>
+      {other}
     </EntryCard>
   );
 }
