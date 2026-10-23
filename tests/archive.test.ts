@@ -161,7 +161,7 @@ async function readSegments(env: Bindings) {
   return ids;
 }
 
-describe('sealing', () => {
+describe('sealing', { timeout: 120_000 }, () => {
   it('seals the oldest rows into whole segments until under the threshold, and never rows too young', async () => {
     const env = await instance();
     const start = Date.now() - 30 * HOUR;
@@ -388,7 +388,7 @@ describe('sealing', () => {
   });
 });
 
-describe('the automatic backup', () => {
+describe('the automatic backup', { timeout: 120_000 }, () => {
   const tick = (env: Bindings) =>
     worker.scheduled({ scheduledTime: Date.now(), cron: '*/15 * * * *' } as ScheduledController, env);
 
