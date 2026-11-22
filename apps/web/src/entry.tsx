@@ -1,8 +1,8 @@
-import { useRef, useState, type FormEvent, type ReactNode } from 'react';
-import { Fault, api, authFault, fault, fv, lines } from './api';
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { Fault, api, authFault, fault, fv, lines, type TokenEndpoint, type Warning } from './api';
 import type { Segment } from './import';
 import { auth, type AppApi } from './shell';
-import { Field, Icon, useOverlay } from './ui';
+import { EndpointAnswer, Field, Icon, useOverlay } from './ui';
 
 /** Pre-console pages share one centred card: initialization, login, device approval and consent. */
 function EntryCard({
@@ -690,6 +690,133 @@ export function ConsentPage({ app, toasts }: { app: AppApi; toasts: ReactNode })
           拒绝
         </button>
       </div>
+    </EntryCard>
+  );
+}
+
+const CALLBACK = '/oauth/callback/';
+export const isCallback = () => location.pathname.startsWith(CALLBACK);
+const toConnections = () => location.assign('/?tab=connections');
+// Said here rather than the console's general text: on this page the next step is always to authorize again.
+const callbackText: Record<string, string> = {
+  connection_changed: '授权开始之后，这条连接又被修改或已删除，没有保存任何东西。请回到 API 连接页重新授权。',
+};
+type Outcome =
+  | { step: 'working' }
+  | { step: 'failed'; message: string; endpoint?: TokenEndpoint }
+  | { step: 'warned'; warnings: Warning[] };
+/** /oauth/callback/<connection id>, where the upstream sends the Owner's browser back after an
+ * authorization. An error the upstream reports is only shown, as text. Otherwise the code and state
+ * leave the address bar at once and go to the server, which completes the authorization in the session
+ * that started it: so no re-verification here, whose new session could not complete it. */
+export function CallbackPage({
+  app,
+  toasts,
+  onDone,
+}: {
+  app: AppApi;
+  toasts: ReactNode;
+  onDone: (text: string) => void;
+}) {
+  // Kept here and out of the address bar from the first render on, signed in or not, so the code and
+  // state stay out of the history and of a reload.
+  const [query] = useState(() => new URLSearchParams(location.search));
+  useEffect(() => history.replaceState(null, '', location.pathname), []);
+  const [outcome, setOutcome] = useState<Outcome>({ step: 'working' });
+  // An effect may run twice on mounting (React's strict mode in development); the code works once.
+  const started = useRef(false);
+  const refused = query.get('error');
+  useEffect(() => {
+    if (!app.owner || refused !== null || started.current) return;
+    started.current = true;
+    const [code, state] = [query.get('code'), query.get('state')];
+    if (!code || !state) {
+      setOutcome({
+        step: 'failed',
+        message: '这个地址里没有授权码，不是上游授权后带回的地址。请回到 API 连接页重新授权。',
+      });
+      return;
+    }
+    void (async () => {
+      try {
+        const r = await api('/admin/oauth/complete', 'POST', {
+          connection: decodeURIComponent(location.pathname.slice(CALLBACK.length)),
+          state,
+          code,
+        });
+        const warnings = (r.warnings ?? []) as Warning[];
+        if (warnings.length) setOutcome({ step: 'warned', warnings });
+        else {
+          history.replaceState(null, '', '/?tab=connections');
+          onDone('授权完成，refresh token 已写入凭据。');
+        }
+      } catch (e) {
+        setOutcome({
+          step: 'failed',
+          message: e instanceof Fault ? (callbackText[e.code] ?? e.message) : '授权没有完成。',
+          endpoint: e instanceof Fault ? e.endpoint : undefined,
+        });
+      }
+    })();
+  }, [app.owner, refused, query, onDone]);
+  if (!app.owner) return <LoginPage app={app} toasts={toasts} note="登录管理员后才能完成授权。" />;
+  const back = (
+    <div className="form-actions">
+      <button type="button" className="btn" onClick={toConnections}>
+        回到 API 连接
+      </button>
+    </div>
+  );
+  // Anyone can link here with an error of their choosing, so the page vouches for none of it: a code is
+  // shown only in the shape OAuth codes have, and the description only as the upstream's quoted words.
+  if (refused !== null) {
+    const said = query.get('error_description');
+    const code = /^[A-Za-z0-9_.-]{1,64}$/.test(refused) ? refused : null;
+    return (
+      <EntryCard title="上游没有授权" description="这次授权没有完成，什么都没有保存。" toasts={toasts}>
+        <div className="review">
+          <dl>
+            <dt>错误</dt>
+            {code ? <dd className="mono">{code}</dd> : <dd>上游返回了错误</dd>}
+            {said ? (
+              <>
+                <dt>上游的原话</dt>
+                <dd>“{said}”</dd>
+              </>
+            ) : null}
+          </dl>
+        </div>
+        {back}
+      </EntryCard>
+    );
+  }
+  if (outcome.step === 'failed')
+    return (
+      <EntryCard title="授权没有完成" description={outcome.message} toasts={toasts}>
+        {outcome.endpoint ? (
+          <div className="review">
+            <EndpointAnswer endpoint={outcome.endpoint} />
+          </div>
+        ) : null}
+        {back}
+      </EntryCard>
+    );
+  if (outcome.step === 'warned')
+    return (
+      <EntryCard title="已授权，但还不能使用" toasts={toasts}>
+        {outcome.warnings.map((w) => (
+          <p key={w.error}>{fault(w.error).message}</p>
+        ))}
+        {back}
+      </EntryCard>
+    );
+  return (
+    <EntryCard
+      title="正在完成授权…"
+      description="正在用上游带回的授权码换 refresh token，请不要关闭页面。"
+      toasts={toasts}
+    >
+      {null}
     </EntryCard>
   );
 }

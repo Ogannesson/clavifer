@@ -6,6 +6,7 @@ import { applyMigrations } from '../scripts/migrations.mjs';
 import { sealColdData } from '../apps/worker/src/archive';
 import { backupStatus, pruneBackups, runAutomaticBackup } from '../apps/worker/src/backup';
 import { type Bindings, audit } from '../apps/worker/src/context';
+import { writeRefreshToken } from '../apps/worker/src/token';
 import { encryptArchiveIdentity, encryptSecret, parseRootKeys, rootKeyFingerprints } from '../packages/core/crypto';
 import { SnapshotValidator, readRecords, type RecordOf, type SnapshotRecord } from '../packages/core/snapshot';
 
@@ -284,6 +285,75 @@ async function instance() {
   ]);
   return env;
 }
+// Connections of the kinds that derive a credential, as the console stores them, on a credential with
+// every field they read and, for the one the Owner is yet to authorize, one without its refresh token.
+const ref = ($field: string) => ({ $field });
+const jwt = { alg: 'RS256', keyField: 'key', header: { kid: ref('kid') }, claims: { iss: ref('id') }, lifetime: 60 };
+const tokenUrl = 'https://auth.example.com/token';
+const DERIVED = {
+  'c-jwt': { type: 'jwt', secretId: 's-derived', jwt: { ...jwt, alg: 'HS256', keyEncoding: 'hex' }, scheme: '' },
+  'c-client': {
+    type: 'oauth-client',
+    secretId: 's-derived',
+    client: { method: 'jwt', id: ref('id'), jwt },
+    grantType: 'account_credentials',
+    bodyFormat: 'json',
+    tokenUrl,
+  },
+  'c-assertion': {
+    type: 'oauth-jwt',
+    secretId: 's-derived',
+    jwt,
+    client: { method: 'post', id: ref('id'), secretField: 'secret' },
+    tokenUrl,
+    ttl: 600,
+  },
+  'c-refresh': {
+    type: 'oauth-refresh',
+    secretId: 's-derived',
+    refreshField: 'refresh',
+    client: { method: 'basic', id: ref('id'), secretField: 'secret' },
+    tokenUrl,
+  },
+  'c-unauthorized': {
+    type: 'oauth-refresh',
+    secretId: 's-unauthorized',
+    refreshField: 'refresh',
+    client: { method: 'post', id: ref('id'), secretField: 'secret' },
+    authorize: { url: 'https://auth.example.com/authorize', params: { prompt: 'consent' } },
+    tokenUrl,
+  },
+};
+const DERIVED_VALUES = { key: 'k', kid: 'i', id: 'client', secret: 's', refresh: 'r1' };
+async function derived(env: Bindings) {
+  await env.DB.batch([
+    ...['s-derived', 's-unauthorized'].map((id) =>
+      insert(env, 'secrets', {
+        id,
+        owner_id: OWNER,
+        name: id,
+        status: 'active',
+        current_version: 1,
+        created_at: T,
+        updated_at: T,
+      }),
+    ),
+    insert(env, 'secret_versions', await version('s-derived', 1, DERIVED_VALUES)),
+    insert(env, 'secret_versions', await version('s-unauthorized', 1, { id: 'client', secret: 's' })),
+    ...Object.entries(DERIVED).map(([id, auth]) =>
+      insert(env, 'connections', {
+        id,
+        owner_id: OWNER,
+        name: id,
+        origin: 'https://api.example.com',
+        auth_json: JSON.stringify(auth),
+        policy_json: JSON.stringify({ paths: ['/'], methods: ['GET'], approval: ['* /**/{r}:setIamPolicy'] }),
+        created_at: T,
+        updated_at: T,
+      }),
+    ),
+  ]);
+}
 // Audit rows of 1000 characters, an hour old, enough to be sealed.
 const fillAudit = (env: Bindings, n: number) =>
   env.DB.prepare(
@@ -329,9 +399,9 @@ describe('the automatic backup', () => {
 
     expect(records[0]).toMatchObject({
       type: 'header',
-      format: 'clavifer-backup-v1',
+      format: 'clavifer-backup-v2',
       kind: 'automatic',
-      source: { origin, rpId: 'localhost', version: '0.5.0' },
+      source: { origin, rpId: 'localhost', version: '0.6.0' },
     });
     expect((records[0] as RecordOf<'header'>).createdAt).toBeGreaterThanOrEqual(before);
     expect(of('owner')).toEqual([
@@ -624,6 +694,10 @@ describe('the automatic backup', () => {
     expect(batches.length).toBe(1);
     expect(new Set(batches[0].batch!.flatMap(reads))).toEqual(new Set(carried));
     expect(batches[0].batch!.every((sql) => sql.startsWith('SELECT '))).toBe(true);
+    // Nor what is derived from the credentials: cached tokens, exchange locks, authorizations in progress.
+    expect(
+      log.flatMap((entry) => entry.batch ?? [entry.single!]).filter((sql) => /token_|oauth_flows/.test(sql)),
+    ).toEqual([]);
     // Outside it, nothing reads a row the snapshot carries: only the size check sums them, and the lease
     // and the result are written to backup_state.
     for (const { single } of log.filter((entry) => entry.single))
@@ -656,6 +730,16 @@ describe('the automatic backup', () => {
       'a Basic connection whose credential lacks the password field',
       'backup_has_broken_connection',
       `UPDATE connections SET auth_json='{"type":"basic","secretId":"s-plain","usernameField":"username","passwordField":"gone"}' WHERE id='c-legacy'`,
+    ],
+    [
+      'a JWT connection whose claims reference a field its credential lacks',
+      'backup_has_broken_connection',
+      `UPDATE connections SET auth_json='{"type":"jwt","secretId":"s-active","jwt":{"alg":"HS256","keyField":"token","keyEncoding":"utf8","claims":{"iss":{"$field":"gone"}},"lifetime":60}}' WHERE id='c-bound'`,
+    ],
+    [
+      'a refresh token connection without authorization whose credential lacks the refresh token',
+      'backup_has_broken_connection',
+      `UPDATE connections SET auth_json='{"type":"oauth-refresh","secretId":"s-active","refreshField":"refresh","client":{"method":"none"},"tokenUrl":"https://auth.example.com/token"}' WHERE id='c-bound'`,
     ],
     [
       'a grant of an installation that is gone',
@@ -704,6 +788,47 @@ describe('the automatic backup', () => {
       status: 503,
     });
     expect(await backupStatus(env)).toMatchObject({ lastError: 'archive_identity_missing', downloadAvailable: false });
+  });
+
+  it('carries connections of every kind that derives a credential, one yet to be authorized included', async () => {
+    const env = await instance();
+    await derived(env);
+    // What deriving leaves behind, which no snapshot carries: a cached token, a lock and an authorization
+    // in progress.
+    await env.DB.batch([
+      insert(env, 'token_cache', {
+        secret_id: 's-derived',
+        recipe: 'recipe',
+        version: 1,
+        envelope_json: '{}',
+        expires_at: Date.now() + 3_600_000,
+        created_at: Date.now(),
+      }),
+      insert(env, 'token_locks', { secret_id: 's-derived', holder: 'holder', until: Date.now() + 30_000 }),
+      insert(env, 'oauth_flows', {
+        state_hash: 'state',
+        session_id: 'session',
+        connection_id: 'c-unauthorized',
+        auth_hash: 'auth',
+        expires_at: Date.now() + 600_000,
+      }),
+    ]);
+    await expect(runAutomaticBackup(env, OWNER, true)).resolves.toMatchObject({ outcome: 'saved' });
+    const { of } = await latest(env);
+    expect(
+      Object.fromEntries(
+        of('connection')
+          .filter((c) => c.id in DERIVED)
+          .map((c) => [c.id, c.auth]),
+      ),
+    ).toEqual(DERIVED);
+    expect(of('connection').find((c) => c.id === 'c-jwt')!.policy.approval).toEqual(['* /**/{r}:setIamPolicy']);
+    expect(of('secret-version').filter((v) => v.secretId.startsWith('s-') && v.secretId !== 's-active')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ secretId: 's-derived', values: DERIVED_VALUES }),
+        expect.objectContaining({ secretId: 's-unauthorized', values: { id: 'client', secret: 's' } }),
+      ]),
+    );
   });
 });
 
@@ -778,12 +903,56 @@ describe('the backup revision', () => {
       ["INSERT INTO session (id,expiresAt,token,createdAt,updatedAt,userId) VALUES ('x',0,'t',0,0,'owner')", false],
       ["INSERT INTO system_state (key,value,updated_at) VALUES ('other','v',0)", false],
       ['UPDATE backup_state SET attempt_at=1 WHERE id=1', false],
+      // What is derived from the credentials.
+      [
+        "INSERT INTO token_cache (secret_id,recipe,version,envelope_json,expires_at,created_at) VALUES ('s2','r',1,'{}',0,0)",
+        false,
+      ],
+      ["UPDATE token_cache SET version=2 WHERE secret_id='s2'", false],
+      ["DELETE FROM token_cache WHERE secret_id='s2'", false],
+      ["INSERT INTO token_locks (secret_id,holder,until) VALUES ('s2','h',0)", false],
+      ["DELETE FROM token_locks WHERE secret_id='s2'", false],
+      [
+        "INSERT INTO oauth_flows (state_hash,session_id,connection_id,auth_hash,expires_at) VALUES ('h','s','c2','a',0)",
+        false,
+      ],
+      ["DELETE FROM oauth_flows WHERE state_hash='h'", false],
     ];
     for (const [sql, counts] of counted) {
       const before = await revision(env);
       await env.DB.prepare(sql).run();
       expect(await revision(env), sql).toBe(before + (counts ? 1 : 0));
     }
+  });
+
+  it('moves when a rotated refresh token becomes the next version, which the next backup carries', async () => {
+    const env = await instance();
+    await derived(env);
+    await runAutomaticBackup(env, OWNER, true);
+    const before = await revision(env);
+    // The system's rotation, audited under the system as an exchange that no installation triggered.
+    const rotated = await writeRefreshToken(env, {
+      owner: OWNER,
+      secretId: 's-derived',
+      field: 'refresh',
+      token: 'r2',
+      mode: 'rotation',
+      used: 'r1',
+      base: { version: 1, values: DERIVED_VALUES },
+      holder: 'holder',
+      exchange: { actor: 'system', result: 'ok' },
+    });
+    expect(rotated).toBe(true);
+    expect(await revision(env)).toBeGreaterThan(before);
+    expect(await backupStatus(env)).toMatchObject({ pending: true });
+    await expect(runAutomaticBackup(env, OWNER)).resolves.toMatchObject({ outcome: 'saved' });
+    const { of } = await latest(env);
+    expect(of('secret').find((s) => s.id === 's-derived')).toMatchObject({ currentVersion: 2 });
+    expect(
+      of('secret-version')
+        .filter((v) => v.secretId === 's-derived')
+        .map((v) => v.values),
+    ).toEqual([DERIVED_VALUES, { ...DERIVED_VALUES, refresh: 'r2' }]);
   });
 
   it('moves once for each sealed segment, not for the rows it moved out', async () => {

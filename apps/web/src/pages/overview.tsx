@@ -1,7 +1,7 @@
 import { archiveErrorMessage, fault, relativeText, timeText } from '../api';
 import { PageHead, RefreshButton, type AppApi, type TabId } from '../shell';
 import { Badge, Icon, Loading, Panel, type Tone } from '../ui';
-import { isExpiringSoon, PendingCard } from './access';
+import { isExpiringSoon, PendingCard, pendingCards } from './access';
 import { runBackupNow } from './backup';
 import { resultTone } from './audit';
 
@@ -135,7 +135,7 @@ export function Overview({ app }: { app: AppApi }) {
       ) : (
         <>
           <div className="alerts">
-            {pending.map((p) => (
+            {pendingCards(pending).map((p) => (
               <PendingCard key={p.id} app={app} request={p} />
             ))}
             {items.map((item) => (

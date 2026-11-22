@@ -1,7 +1,10 @@
 import { useState } from 'react';
+import { authorizes, exchanges, requiredFields } from '../../../../packages/core/auth';
 import {
   api,
   authTypeText,
+  awaitingAuthorization,
+  Fault,
   fv,
   hostedSuffixText,
   lines,
@@ -12,9 +15,13 @@ import {
   type Connection,
   type ConnectionAuth,
   type ConnectionPolicy,
+  type TokenEndpoint,
 } from '../api';
+import { authToForm, formToAuth, type FormValues } from '../auth-form';
+import { placeholders, PRESETS, type Preset } from '../presets';
 import { PageHead, RefreshButton, type AppApi } from '../shell';
-import { Badge, Drawer, EmptyState, Field, Icon, Loading, Panel, useConfirm } from '../ui';
+import { Badge, Drawer, EmptyState, EndpointRefusal, Field, Icon, Loading, Panel, useConfirm } from '../ui';
+import { FieldSelect, isTokenType, TOKEN_TYPES, TokenAuthFields } from './token-auth';
 
 const boundSecretId = (auth: ConnectionAuth) => (auth.type === 'none' ? null : auth.secretId);
 /** The three rule lists share one format; the order here is the order the server applies them. */
@@ -39,24 +46,70 @@ const RULES = [
   },
 ] as const;
 
-/** Offers only the bound credential's own fields: keeps the given name if the credential has it, else its only field. */
-function FieldSelect({ name, fields, value }: { name: string; fields: string[]; value: string }) {
+/** Starts an authorization of a saved connection, then names the host the browser is about to be sent to
+ * and goes there only on a second click, in this tab: the Owner sees where they will sign in first. */
+export function AuthorizeButton({ app, connection, label }: { app: AppApi; connection: string; label: string }) {
+  const [target, setTarget] = useState<{ url: string; host: string } | null>(null);
+  if (target)
+    return (
+      <span className="authorize-go">
+        <button type="button" className="btn btn--small" onClick={() => location.assign(target.url)}>
+          前往 {target.host} 授权
+        </button>
+        <button type="button" className="btn btn--quiet btn--small" onClick={() => setTarget(null)}>
+          取消
+        </button>
+      </span>
+    );
   return (
-    <select name={name} required defaultValue={fields.includes(value) ? value : fields.length === 1 ? fields[0] : ''}>
-      <option value="">请选择</option>
-      {fields.map((f) => (
-        <option key={f} value={f}>
-          {f}
-        </option>
-      ))}
-    </select>
+    <button
+      type="button"
+      className="btn btn--ghost btn--small"
+      disabled={app.busy}
+      onClick={() =>
+        void app.run(async () => {
+          setTarget((await api(`/admin/connections/${connection}/authorize`, 'POST')) as { url: string; host: string });
+        }, '')
+      }
+    >
+      {label}
+    </button>
   );
 }
+/** An address the Owner registers upstream, with a button that copies it. */
+export function Copyable({ app, text }: { app: AppApi; text: string }) {
+  return (
+    <>
+      <span className="mono">{text}</span>{' '}
+      <button
+        type="button"
+        className="btn btn--quiet btn--small"
+        onClick={() =>
+          void navigator.clipboard.writeText(text).then(
+            () => app.notify('已复制回调地址。'),
+            () => app.notify('复制失败，请手动选中地址复制。', true),
+          )
+        }
+      >
+        复制
+      </button>
+    </>
+  );
+}
+
+// Presets by the kind they set, in the order of authTypeText.
+const presetGroups = TOKEN_TYPES.map((type) => [type, PRESETS.filter((p) => p.auth.type === type)] as const);
 
 export function Connections({ app }: { app: AppApi }) {
   const [editing, setEditing] = useState<{ connection: Connection | null } | null>(null);
   const [authType, setAuthType] = useState('none');
   const [secretId, setSecretId] = useState('');
+  const [origin, setOrigin] = useState('');
+  // What the token settings start from, and a key that remounts them when it is replaced.
+  const [seed, setSeed] = useState<{ form: FormValues; key: number }>({ form: {}, key: 0 });
+  const [preset, setPreset] = useState<Preset | null>(null);
+  // The token endpoint's refusal of the last save, shown on the form until the next save or a close.
+  const [refused, setRefused] = useState<{ message: string; endpoint: TokenEndpoint } | null>(null);
   const confirm = useConfirm();
   const connection = editing?.connection ?? null;
   const auth = connection ? parseAuth(connection) : null;
@@ -66,7 +119,19 @@ export function Connections({ app }: { app: AppApi }) {
   const openEditor = (target: Connection | null) => {
     setAuthType(target ? parseAuth(target).type : 'none');
     setSecretId((target && boundSecretId(parseAuth(target))) ?? '');
+    setOrigin(target?.origin ?? '');
+    setSeed((s) => ({ form: authToForm(target ? parseAuth(target) : null), key: s.key + 1 }));
+    setPreset(null);
+    setRefused(null);
     setEditing({ connection: target });
+  };
+  const pickPreset = (id: string) => {
+    const next = PRESETS.find((p) => p.id === id) ?? null;
+    setPreset(next);
+    if (!next) return;
+    setAuthType(next.auth.type);
+    setOrigin(next.origin);
+    setSeed((s) => ({ form: authToForm(next.auth), key: s.key + 1 }));
   };
 
   const remove = async (c: Connection) => {
@@ -88,44 +153,75 @@ export function Connections({ app }: { app: AppApi }) {
   // stay as they are.
   const members = (sid: string | null) =>
     sid ? app.status.connections.filter((c) => boundSecretId(parseAuth(c)) === sid) : [];
+  const awaiting = (a: ConnectionAuth) =>
+    awaitingAuthorization(a, app.status.secrets) ? <Badge tone="warn">待授权</Badge> : null;
   // Everything a connection's card says below its address; in a group it sits behind the row's details.
-  const particulars = (c: Connection, p: ConnectionPolicy) => (
-    <>
-      {c.description ? <p className="row-meta">说明：{c.description}</p> : null}
-      <p className="row-meta">
-        {(p.methods ?? ['GET', 'HEAD']).join(' ')} · 路径 {p.paths.join('、')}
-      </p>
-      {/* Rules as the server normalized them, so a bare path shows the method it received. */}
-      {RULES.map((r) =>
-        p[r.name]?.length ? (
-          <p className="row-meta" key={r.name}>
-            {r.label} {p[r.name]!.length} 条：<span className="mono">{p[r.name]!.join('、')}</span>
+  const particulars = (c: Connection, p: ConnectionPolicy) => {
+    const a = parseAuth(c);
+    return (
+      <>
+        {c.description ? <p className="row-meta">说明：{c.description}</p> : null}
+        <p className="row-meta">
+          {(p.methods ?? ['GET', 'HEAD']).join(' ')} · 路径 {p.paths.join('、')}
+        </p>
+        {/* Rules as the server normalized them, so a bare path shows the method it received. */}
+        {RULES.map((r) =>
+          p[r.name]?.length ? (
+            <p className="row-meta" key={r.name}>
+              {r.label} {p[r.name]!.length} 条：<span className="mono">{p[r.name]!.join('、')}</span>
+            </p>
+          ) : null,
+        )}
+        {p.hosts?.length ? (
+          <p className="row-meta">
+            额外域名 {p.hosts.length} 条（须单次审批）：<span className="mono">{p.hosts.join('、')}</span>
           </p>
-        ) : null,
-      )}
-      {p.hosts?.length ? (
-        <p className="row-meta">
-          额外域名 {p.hosts.length} 条（须单次审批）：<span className="mono">{p.hosts.join('、')}</span>
-        </p>
-      ) : null}
-      {p.anyHost ? (
-        <p className="row-meta">
-          <Badge tone="warn">可经单次审批发往任意地址</Badge>
-        </p>
-      ) : null}
-      <p className="row-meta mono">{c.id}</p>
-    </>
-  );
-  const actions = (c: Connection) => (
-    <div className="row-actions">
-      <button type="button" className="btn btn--ghost btn--small" disabled={app.busy} onClick={() => openEditor(c)}>
-        编辑
-      </button>
-      <button type="button" className="btn btn--danger btn--small" disabled={app.busy} onClick={() => void remove(c)}>
-        删除
-      </button>
-    </div>
-  );
+        ) : null}
+        {p.anyHost ? (
+          <p className="row-meta">
+            <Badge tone="warn">可经单次审批发往任意地址</Badge>
+          </p>
+        ) : null}
+        {exchanges(a) ? (
+          <p className="row-meta">
+            token 端点 <span className="mono">{a.tokenUrl}</span>
+          </p>
+        ) : null}
+        {authorizes(a) ? (
+          <p className="row-meta">
+            授权地址 <span className="mono">{a.authorize.url}</span>
+          </p>
+        ) : null}
+        {c.callback ? (
+          <p className="row-meta">
+            回调地址（登记到上游的 OAuth 客户端）：
+            <Copyable app={app} text={c.callback} />
+          </p>
+        ) : null}
+        <p className="row-meta mono">{c.id}</p>
+      </>
+    );
+  };
+  const actions = (c: Connection) => {
+    const a = parseAuth(c);
+    return (
+      <div className="row-actions">
+        {authorizes(a) ? (
+          <AuthorizeButton
+            app={app}
+            connection={c.id}
+            label={awaitingAuthorization(a, app.status.secrets) ? '授权' : '重新授权'}
+          />
+        ) : null}
+        <button type="button" className="btn btn--ghost btn--small" disabled={app.busy} onClick={() => openEditor(c)}>
+          编辑
+        </button>
+        <button type="button" className="btn btn--danger btn--small" disabled={app.busy} onClick={() => void remove(c)}>
+          删除
+        </button>
+      </div>
+    );
+  };
 
   return (
     <>
@@ -160,6 +256,7 @@ export function Connections({ app }: { app: AppApi }) {
                         <h3>{c.name}</h3>
                         <Badge tone={a.type === 'none' ? 'neutral' : 'accent'}>{authTypeText[a.type]}</Badge>
                         {bound ? <Badge>凭据 · {resourceName(app.status, bound)}</Badge> : null}
+                        {awaiting(a)}
                       </div>
                       <p className="row-meta mono">{c.origin}</p>
                       {particulars(c, p)}
@@ -177,6 +274,9 @@ export function Connections({ app }: { app: AppApi }) {
                       <div className="row-title">
                         <h3>{resourceName(app.status, bound!)}</h3>
                         <Badge>凭据 · {group.length} 条连接</Badge>
+                        {group.some((m) => awaitingAuthorization(parseAuth(m), app.status.secrets)) ? (
+                          <Badge tone="warn">待授权</Badge>
+                        ) : null}
                       </div>
                       <p className="row-meta mono">{[...new Set(group.map((m) => m.origin))].join('、')}</p>
                     </div>
@@ -191,6 +291,7 @@ export function Connections({ app }: { app: AppApi }) {
                             <div className="row-title">
                               <h3>{m.name}</h3>
                               <Badge tone="accent">{authTypeText[auth.type]}</Badge>
+                              {awaiting(auth)}
                               {policy.hosts?.length ? (
                                 <Badge tone="warn">额外域名 {policy.hosts.length} 条</Badge>
                               ) : null}
@@ -237,47 +338,88 @@ export function Connections({ app }: { app: AppApi }) {
           onSubmit={(e) => {
             e.preventDefault();
             const f = new FormData(e.currentTarget);
+            setRefused(null);
             void app.run(async () => {
               const methods = f.getAll('methods').map(String);
               if (!methods.length) throw new Error('至少勾选一个允许的方法。');
-              const type = fv(f, 'type');
-              const secretId = fv(f, 'secretId');
-              const binding: ConnectionAuth =
-                type === 'none'
-                  ? { type: 'none' }
-                  : type === 'basic'
-                    ? {
-                        type: 'basic',
-                        secretId,
-                        usernameField: fv(f, 'usernameField').trim(),
-                        passwordField: fv(f, 'passwordField').trim(),
-                      }
-                    : type === 'bearer'
-                      ? { type: 'bearer', secretId, field: fv(f, 'field').trim() }
-                      : {
-                          type: type === 'header' ? 'header' : 'query',
-                          secretId,
-                          field: fv(f, 'field').trim(),
-                          name: fv(f, 'headerName').trim(),
-                        };
-              await api('/admin/connections' + (connection ? '/' + connection.id : ''), connection ? 'PUT' : 'POST', {
-                name: fv(f, 'name').trim(),
-                origin: fv(f, 'origin').trim(),
-                description: fv(f, 'description').trim(),
-                paths: lines(fv(f, 'paths')),
-                methods,
-                deny: lines(fv(f, 'deny')),
-                approval: lines(fv(f, 'approval')),
-                free: lines(fv(f, 'free')),
-                hosts: lines(fv(f, 'hosts')),
-                anyHost: f.has('anyHost'),
-                auth: binding,
-              });
+              const binding = formToAuth(Object.fromEntries([...f].map(([name, value]) => [name, String(value)])));
+              // A preset's placeholders name the Owner's tenant, domain or account; none may be saved as is.
+              const left = preset
+                ? placeholders([origin, binding]).filter((name) =>
+                    placeholders([preset.origin, preset.auth]).includes(name),
+                  )
+                : [];
+              if (left.length)
+                throw new Error(`预设里的占位还没换成你的值：${left.map((name) => `{${name}}`).join('、')}。`);
+              try {
+                await api('/admin/connections' + (connection ? '/' + connection.id : ''), connection ? 'PUT' : 'POST', {
+                  name: fv(f, 'name').trim(),
+                  origin: origin.trim(),
+                  description: fv(f, 'description').trim(),
+                  paths: lines(fv(f, 'paths')),
+                  methods,
+                  deny: lines(fv(f, 'deny')),
+                  approval: lines(fv(f, 'approval')),
+                  free: lines(fv(f, 'free')),
+                  hosts: lines(fv(f, 'hosts')),
+                  anyHost: f.has('anyHost'),
+                  auth: binding,
+                });
+              } catch (e) {
+                // The test of the credential failed at the token endpoint: what it said stays on the form.
+                if (!(e instanceof Fault && e.endpoint)) throw e;
+                setRefused({ message: e.message, endpoint: e.endpoint });
+                return;
+              }
               setEditing(null);
               await app.refresh();
-            }, '连接已保存。');
+              app.notify('连接已保存。');
+            }, '');
           }}
         >
+          <Field
+            label="从预设填写（可选）"
+            hint="按厂商文档填好 token 端点、JWT 和客户端认证；凭据和其余设置仍由你填写。"
+          >
+            <select value={preset?.id ?? ''} onChange={(e) => pickPreset(e.target.value)}>
+              <option value="">不用预设</option>
+              {presetGroups.map(([type, list]) => (
+                <optgroup key={type} label={authTypeText[type]}>
+                  {list.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.label}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+          </Field>
+          {preset ? (
+            <div className="note">
+              <p>
+                读取凭据字段 <span className="mono">{requiredFields(preset.auth).join('、')}</span>
+                ，先在「凭据」里建好这些字段
+                {authorizes(preset.auth) ? `（${preset.auth.refreshField} 由保存后的授权写入）` : ''}。
+                {placeholders([preset.origin, preset.auth]).length
+                  ? `把 ${placeholders([preset.origin, preset.auth])
+                      .map((name) => `{${name}}`)
+                      .join('、')} 换成你的值。`
+                  : ''}
+                {preset.note ?? ''}
+              </p>
+              <p>
+                取值出处（查证于 {preset.checked}）：
+                {preset.source.map((url, i) => (
+                  <span key={url}>
+                    {i ? '、' : ''}
+                    <a href={url} target="_blank" rel="noreferrer">
+                      {url}
+                    </a>
+                  </span>
+                ))}
+              </p>
+            </div>
+          ) : null}
           <Field label="名称">
             <input name="name" maxLength={120} required defaultValue={connection?.name ?? ''} />
           </Field>
@@ -287,7 +429,8 @@ export function Connections({ app }: { app: AppApi }) {
               type="url"
               placeholder="https://api.example.com"
               required
-              defaultValue={connection?.origin ?? ''}
+              value={origin}
+              onChange={(e) => setOrigin(e.target.value)}
             />
           </Field>
           <Field
@@ -326,8 +469,11 @@ export function Connections({ app }: { app: AppApi }) {
           </fieldset>
           <p className="note">
             下面三类规则每行一条，格式为「方法 路径」：方法写 GET、POST 等或 *（任意方法），GET 同时覆盖
-            HEAD；也可以只写路径，保存时补成默认方法（见各栏说明）。路径以 / 开头，默认精确匹配，末尾写 /*
-            表示该路径及其所有子路径。匹配不区分英文大小写，不看查询串，按解码后的路径比较（段内的 %2F 视为斜杠）。
+            HEAD；也可以只写路径，保存时补成默认方法（见各栏说明）。路径以 / 开头，默认精确匹配；一段用
+            {'{名字}'}（如 /v1/items/{'{id}'}、{'{r}'}:setIamPolicy，名字只是备注），任意多段用 **，末尾写 /*
+            表示该路径及其所有子路径。匹配不区分英文大小写，不看查询串，按解码后的路径比较（段内的 %2F
+            视为斜杠）；拒绝和审批规则还按原样分段再比一次（%2F 留在段内），任一种命中即算命中；带 {'{名字}'} 或 **
+            的免审批规则则要两种都命中才算命中。
           </p>
           {RULES.map((r) => (
             <Field key={r.name} label={`${r.label}规则`} hint={r.hint}>
@@ -382,7 +528,15 @@ export function Connections({ app }: { app: AppApi }) {
                   ))}
                 </select>
               </Field>
-              {authType === 'basic' ? (
+              {isTokenType(authType) ? (
+                <TokenAuthFields
+                  key={`${seed.key}:${authType}`}
+                  type={authType}
+                  form={seed.form}
+                  fields={fields}
+                  secretId={secretId}
+                />
+              ) : authType === 'basic' ? (
                 <div className="field-row field-row--pair">
                   <Field label="用户名字段">
                     <FieldSelect
@@ -430,6 +584,7 @@ export function Connections({ app }: { app: AppApi }) {
               ) : null}
             </>
           )}
+          {refused ? <EndpointRefusal {...refused} onClose={() => setRefused(null)} /> : null}
           <div className="form-actions">
             <button className="btn" disabled={app.busy}>
               保存连接

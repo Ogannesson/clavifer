@@ -9,6 +9,7 @@ import {
   type RefObject,
 } from 'react';
 import { createPortal } from 'react-dom';
+import type { TokenEndpoint } from './api';
 
 /** Inline SVG keeps the icon set inside the bundle; no icon package and no remote requests. */
 const paths: Record<string, ReactNode> = {
@@ -312,6 +313,59 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
         ) : null}
       </dialog>
     </ConfirmContext>
+  );
+}
+
+/** What a token endpoint answered, as the Owner's routes pass it on. The description is the upstream's
+ * own words, shown as text and quoted as such, and only when it sent one. */
+export const EndpointAnswer = ({ endpoint }: { endpoint: TokenEndpoint }) => (
+  <dl className="request-call">
+    <dt>token 端点</dt>
+    <dd className="mono">{endpoint.host ?? '—'}</dd>
+    <dt>HTTP 状态</dt>
+    <dd className="mono">{endpoint.status ?? '—'}</dd>
+    <dt>错误</dt>
+    <dd className="mono">{endpoint.error ?? '—'}</dd>
+    {endpoint.error_description ? (
+      <>
+        <dt>上游的原话</dt>
+        <dd>“{endpoint.error_description}”</dd>
+      </>
+    ) : null}
+  </dl>
+);
+/** A refusal of a token endpoint where the Owner acted, kept until the Owner closes it or tries again:
+ * its description is often longer than a toast stays. It appears above the button that was pressed,
+ * so it scrolls itself into view. */
+export function EndpointRefusal({
+  message,
+  endpoint,
+  onClose,
+}: {
+  message: string;
+  endpoint: TokenEndpoint;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  // In braces: a browser may return a promise from scrollIntoView, which React would call as a cleanup.
+  useEffect(() => {
+    ref.current?.scrollIntoView({ block: 'nearest' });
+  }, []);
+  return (
+    <div className="alert alert--danger" role="alert" ref={ref}>
+      <span className="alert-icon">
+        <Icon name="alert" size={18} />
+      </span>
+      <div className="alert-body">
+        <strong>{message}</strong>
+        <EndpointAnswer endpoint={endpoint} />
+        <div className="alert-actions">
+          <button type="button" className="btn btn--ghost btn--small" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 

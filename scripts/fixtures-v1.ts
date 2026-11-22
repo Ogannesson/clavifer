@@ -5,7 +5,8 @@
 // Run: npx tsx scripts/fixtures-v1.ts. It never overwrites a file; the samples may be regenerated, by
 // deleting them first, only until the release that freezes them, and tests/snapshot.test.ts pins their
 // SHA-256 then. The segments are a few rows each, sealed here as archive.ts seals about 1 MB, so the
-// samples stay small.
+// samples stay small. The samples are frozen and the Worker now writes v2 (scripts/fixtures-v2.ts), so
+// this script records how they were made; run today, it would write v2 files.
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';

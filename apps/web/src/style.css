@@ -807,6 +807,35 @@ legend {
 .field-row--pair {
   grid-template-columns: 1fr 1fr;
 }
+/* A credential value: its box with the file button beside it, and below them the passphrase of an
+ * encrypted key and any problem with what was loaded. */
+.value-input {
+  display: grid;
+  gap: 6px;
+}
+.value-line {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.value-line > input {
+  flex: 1;
+  min-width: 0;
+}
+.value-line > .btn {
+  flex: none;
+}
+.value-problem {
+  color: var(--danger);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+/* The second step of authorizing: where the browser goes next, and a way back. */
+.authorize-go {
+  display: inline-flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
 .form-actions {
   display: flex;
   gap: 10px;

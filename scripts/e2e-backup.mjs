@@ -1,15 +1,18 @@
 // Automatic backups of the built Worker, and the recovery they exist for. The instance backs up to R2 and
 // seals old audit rows into archive/; then its root key is lost: a new database and a new root key on the
 // same bucket, into which the latest automatic backup is imported through the console's own importer, after
-// which the Owner, the installation and its grant work as before. Runs under tsx, which loads the importer.
+// which the Owner, the installation and its grant work as before, and a connection whose token is derived
+// exchanges anew. Runs under tsx, which loads the importer.
 import { Miniflare, convertV4MiniflareOptions, Log, LogLevel } from 'miniflare';
 import { randomBytes, createHash } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import assert from 'node:assert/strict';
 import { generateIdentity, identityToRecipient, Decrypter } from 'age-encryption';
 import { applyMigrations } from './migrations.mjs';
 import { issueSql, newToken } from './bootstrap-token.mjs';
 import { importSnapshot } from '../apps/web/src/import.ts';
+import { tokenServer } from './e2e-token-server.mjs';
 
 const root = `work/backup-e2e-${Date.now()}`;
 await mkdir(root, { recursive: true });
@@ -37,6 +40,13 @@ const options = (database) =>
     },
   });
 const mf = new Miniflare(options('original'));
+// The authorization server and upstream of the connections whose tokens are derived.
+const fake = tokenServer();
+const upstream = createServer((req, res) => {
+  if (!fake.handle(req, res, new URL(req.url, 'http://localhost'))) res.writeHead(404).end();
+});
+await new Promise((done) => upstream.listen(0, '127.0.0.1', done));
+const upstreamOrigin = `http://127.0.0.1:${upstream.address().port}`;
 let cookie = '',
   checks = 0;
 async function call(path, { method = 'GET', body, status = 200, owner = true, headers = {} } = {}) {
@@ -88,7 +98,7 @@ async function deviceToken(clientId) {
     })
   ).access_token;
 }
-/** The records of a v1 snapshot (JSON Lines). */
+/** The records of a snapshot (JSON Lines). */
 async function decrypt(identity, bytes) {
   const d = new Decrypter();
   d.addIdentity(identity);
@@ -167,7 +177,7 @@ try {
     download.headers.get('x-backup-sha256'),
   );
   const snapshot = await decrypt(identity, bytes);
-  assert.deepEqual([snapshot[0].format, snapshot[0].kind], ['clavifer-backup-v1', 'automatic']);
+  assert.deepEqual([snapshot[0].format, snapshot[0].kind], ['clavifer-backup-v2', 'automatic']);
   assert.equal(values(snapshot, secret.id).password, 'synthetic-backup-password');
   assert.equal(snapshot.find((r) => r.type === 'connection').auth.type, 'basic');
   assert.equal(snapshot.find((r) => r.type === 'owner').email, 'backup@example.com');
@@ -226,6 +236,75 @@ try {
   await decrypt(secondIdentity, rotatedBytes);
   await assert.rejects(() => decrypt(identity, rotatedBytes));
   await decrypt(identity, bytes);
+  // Connections whose tokens are derived: by client credentials, and by a refresh token the endpoint
+  // rotates on every use, on a connection the Owner authorizes. Saving tries both and caches the tokens,
+  // which the installation then gets; an authorization is started and never completed.
+  const derived = await json('/admin/secrets', {
+    method: 'POST',
+    status: 201,
+    body: {
+      name: 'Derived values',
+      values: { client_id: fake.client.id, client_secret: fake.client.secret, refresh_token: fake.refreshToken() },
+    },
+  });
+  const derivedConnection = async (name, auth) =>
+    (
+      await json('/admin/connections', {
+        method: 'POST',
+        body: {
+          name,
+          origin: upstreamOrigin,
+          paths: ['/whoami'],
+          methods: ['GET'],
+          auth: {
+            secretId: derived.id,
+            client: { method: 'basic', id: { $field: 'client_id' }, secretField: 'client_secret' },
+            ...auth,
+          },
+        },
+      })
+    ).id;
+  const byClient = await derivedConnection('Client credentials', {
+    type: 'oauth-client',
+    tokenUrl: upstreamOrigin + '/token/client',
+  });
+  const byRefresh = await derivedConnection('Signed-in user', {
+    type: 'oauth-refresh',
+    refreshField: 'refresh_token',
+    authorize: { url: upstreamOrigin + '/authorize' },
+    tokenUrl: upstreamOrigin + '/token/refresh',
+  });
+  await call('/admin/grants', {
+    method: 'POST',
+    body: {
+      clientId: client,
+      grants: [byClient, byRefresh].map((resourceId) => ({
+        resourceType: 'connection',
+        resourceId,
+        permission: 'connection:invoke',
+      })),
+    },
+  });
+  // The token an installation's request through connection presented upstream.
+  const presented = async (connection, agent) =>
+    (
+      await json(`/v1/proxy/${connection}/whoami`, { owner: false, headers: { authorization: `Bearer ${agent}` } })
+    ).authorization.slice(7);
+  const beforeLoss = await deviceToken(client);
+  const cached = [await presented(byClient, beforeLoss), await presented(byRefresh, beforeLoss)];
+  assert.deepEqual(
+    cached.map((token) => fake.issued.get(token)),
+    ['client', 'refresh'],
+  );
+  assert.deepEqual([fake.calls.client, fake.calls.refresh], [1, 1], 'the tokens saving cached serve the requests');
+  await call(`/admin/connections/${byRefresh}/authorize`, { method: 'POST' });
+  assert.deepEqual(
+    [
+      (await db.prepare('SELECT COUNT(*) AS n FROM token_cache').first()).n,
+      (await db.prepare('SELECT COUNT(*) AS n FROM oauth_flows').first()).n,
+    ],
+    [2, 1],
+  );
   // The scheduled run seals 2 MB of audit rows an hour old into archive/ and backs up after it: the backup
   // names the segment by its key in this bucket.
   const { value: owner } = await db.prepare("SELECT value FROM system_state WHERE key='owner_user_id'").first();
@@ -294,7 +373,10 @@ try {
   const restored = await json('/admin/status');
   assert.deepEqual(
     restored.secrets.map((s) => [s.id, s.fields.sort()]),
-    [[secret.id, ['password', 'username']]],
+    [
+      [secret.id, ['password', 'username']],
+      [derived.id, ['client_id', 'client_secret', 'refresh_token']],
+    ],
   );
   assert.equal(restored.backup.recipient, await identityToRecipient(secondIdentity), 'the recipient came along');
   // The installation logs in again under its client id; its grant and the rotated value came along.
@@ -309,6 +391,25 @@ try {
     ).values,
     { username: 'backup-test-user', password: 'rotated-backup-test' },
   );
+  // Neither a cached token nor the unfinished authorization came along. The first request through each
+  // connection exchanges anew, with the refresh token the snapshot holds: the one saving rotated to.
+  assert.deepEqual(
+    [
+      (await rebuilt.prepare('SELECT COUNT(*) AS n FROM token_cache').first()).n,
+      (await rebuilt.prepare('SELECT COUNT(*) AS n FROM oauth_flows').first()).n,
+    ],
+    [0, 0],
+  );
+  const exchanged = [await presented(byClient, agent), await presented(byRefresh, agent)];
+  assert.deepEqual(
+    exchanged.map((token) => fake.issued.get(token)),
+    ['client', 'refresh'],
+  );
+  assert.deepEqual(
+    [fake.calls.client, fake.calls.refresh, fake.calls.reused],
+    [2, 2, 0],
+    'after the import each connection exchanged once',
+  );
   // The rebuilt instance backs up again, naming the same segment.
   await json('/admin/backup/run', { method: 'POST' });
   assert.equal((await json('/admin/backup/status')).lastError, null);
@@ -321,7 +422,7 @@ try {
       'concurrent lease',
       'consistent revision',
       'age decrypt',
-      'v1 snapshot',
+      'v2 snapshot',
       'rotation',
       'broken-binding retry',
       'abandoned lease',
@@ -330,6 +431,7 @@ try {
       'same-day retention',
       'transaction rollback',
       'recovery from a lost root key by import',
+      'derived tokens exchanged anew after the import',
     ],
     retainedArtifacts: root,
   };
@@ -339,4 +441,5 @@ try {
   );
 } finally {
   await mf.dispose();
+  await new Promise((done) => upstream.close(done));
 }

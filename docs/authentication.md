@@ -31,7 +31,7 @@ The Owner signs in with email and password, or with a Passkey.
 
 - **Password.** At least 12 characters. Changing it in the console signs the browser out and revokes the Owner's other sessions.
 - **Passkey.** A WebAuthn credential bound to the service's hostname. The Owner can register several, name them, rename them, and delete them. Deleting one does not affect password sign-in.
-- **Session.** A session lasts 24 hours and is extended while it is in use.
+- **Session.** A session lasts 24 hours and is extended while it is in use. A console tab in view reads the state every 15 seconds, which counts as use.
 - **Rate limit.** The auth endpoints under `/api/auth` are limited to 100 requests per 60 seconds, and the device code lookup to 30, counted by client IP address.
 
 There is no email recovery. Keep at least one working way to sign in, and register more than one Passkey. If the password and every Passkey are lost, whoever can deploy the service issues a new bootstrap token, and `/setup` sets a new password with it, as described [above](#bootstrap-token).
@@ -45,6 +45,7 @@ Some operations require that the Owner signed in within the last 10 minutes. The
 | Create a grant                                                                   | `POST /admin/grants`                                                                                                                                           |
 | Approve an access request                                                        | `POST /admin/access-requests/{id}/approve`                                                                                                                     |
 | Create or edit a connection                                                      | `POST /admin/connections`, `PUT /admin/connections/{id}`                                                                                                       |
+| Start authorizing a connection at its upstream                                   | `POST /admin/connections/{id}/authorize`                                                                                                                       |
 | Download a full export                                                           | `GET /admin/backup/export`                                                                                                                                     |
 | Set or clear the backup recipient                                                | `PUT /admin/backup/config`                                                                                                                                     |
 | Look up, approve, or deny a device code                                          | `/api/auth/device`, `/api/auth/device/approve`, `/api/auth/device/deny`                                                                                        |

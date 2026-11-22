@@ -38,7 +38,7 @@ async function fixture(auth: ReturnType<typeof authInput.parse>, values: Record<
           },
           async first() {
             if (sql.includes('FROM grants')) return allowed ? { allowed: 1 } : null;
-            if (sql.includes('UPDATE access_requests')) return null;
+            if (sql.includes('FROM access_requests')) return null;
             if (sql.includes('FROM connections'))
               return {
                 origin: 'https://api.example.com',

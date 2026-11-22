@@ -303,7 +303,7 @@ beforeAll(async () => {
 afterAll(() => mf.dispose());
 
 describe('full export', () => {
-  it('carries every row of the instance in the v1 format', async () => {
+  it('carries every row of the instance in the v2 format', async () => {
     const audits = (await env.DB.prepare('SELECT COUNT(*) AS n FROM audit_events').first<{ n: number }>())!.n;
     const { records, of, text } = await exportAll();
     const end = of('end')[0];
@@ -322,8 +322,9 @@ describe('full export', () => {
     });
     expect(records[0]).toMatchObject({
       type: 'header',
+      format: 'clavifer-backup-v2',
       kind: 'full',
-      source: { origin, rpId: 'localhost', version: '0.5.0' },
+      source: { origin, rpId: 'localhost', version: '0.6.0' },
     });
 
     const owner = of('owner')[0];
@@ -654,5 +655,62 @@ describe('full export', () => {
     expect(await call(`/admin/backup/exports/${new URL(origin + url).searchParams.get('id')}`)).toEqual({
       status: 'unknown',
     });
+  });
+
+  it('carries a connection that signs a JWT as the console saved it, and one not yet authorized', async () => {
+    const signing = String(
+      (await call('/admin/secrets', 'POST', { name: 'Signing', values: { id: 'synthetic-id', key: 'a1b2c3d4' } })).id,
+    );
+    const signed = String(
+      (
+        await call('/admin/connections', 'POST', {
+          name: 'Signed',
+          origin: 'https://signed.example.com',
+          paths: ['/'],
+          approval: ['* /**/{r}:setIamPolicy'],
+          auth: {
+            type: 'jwt',
+            secretId: signing,
+            jwt: {
+              alg: 'HS256',
+              keyField: 'key',
+              keyEncoding: 'hex',
+              header: { kid: { $field: 'id' } },
+              claims: { aud: '/admin/', room: { join: true } },
+              lifetime: 300,
+            },
+            scheme: 'Ghost',
+          },
+        })
+      ).id,
+    );
+    // The authorization flow saves a connection before its credential holds a refresh token.
+    const auth = {
+      type: 'oauth-refresh',
+      secretId: signing,
+      refreshField: 'refresh_token',
+      client: { method: 'post', id: { $field: 'id' }, secretField: 'key' },
+      authorize: { url: 'https://auth.example.com/authorize', scope: 'read' },
+      tokenUrl: 'https://auth.example.com/token',
+    };
+    await run(
+      "INSERT INTO connections (id,owner_id,name,origin,auth_json,policy_json,created_at,updated_at) VALUES ('pending','unused','Pending','https://pending.example.com',?,?,?,?)",
+      JSON.stringify(auth),
+      JSON.stringify({ paths: ['/'] }),
+      Date.now(),
+      Date.now(),
+    );
+    const { records, of } = await exportAll();
+    expect(records[0]).toMatchObject({ type: 'header', format: 'clavifer-backup-v2', kind: 'full' });
+    expect(of('connection').find((c) => c.id === signed)).toMatchObject({
+      auth: {
+        type: 'jwt',
+        secretId: signing,
+        jwt: { alg: 'HS256', keyEncoding: 'hex', header: { kid: { $field: 'id' } }, claims: { room: { join: true } } },
+        scheme: 'Ghost',
+      },
+      policy: { approval: ['* /**/{r}:setIamPolicy'] },
+    });
+    expect(of('connection').find((c) => c.id === 'pending')!.auth).toEqual(auth);
   });
 });

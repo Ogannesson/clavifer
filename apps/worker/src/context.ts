@@ -13,7 +13,7 @@ export type Bindings = Env & {
   ROOT_KEY?: string;
 };
 export type Principal = { clientId: string; userId: string; scopes: string[] };
-export const VERSION = '0.5.0';
+export const VERSION = '0.6.0';
 export const now = () => Date.now();
 export const id = () => crypto.randomUUID();
 // Every audit row of one invocation carries the request id published in the
@@ -22,6 +22,16 @@ const currentRequestId = new AsyncLocalStorage<string>();
 export const withRequestId = <T>(value: string, fn: () => T) => currentRequestId.run(value, fn);
 // For work that runs after the handler returned, such as the end of a streamed response.
 export const requestId = () => currentRequestId.getStore() ?? id();
+// The request's execution context, so work that must not stop with a client that disconnects can be
+// handed to waitUntil wherever it runs.
+const currentContext = new AsyncLocalStorage<ExecutionContext>();
+export const withContext = <T>(ctx: ExecutionContext, fn: () => T) => currentContext.run(ctx, fn);
+/** Keeps the request running until promise settles, even when the client disconnects first (for up to
+ * 30 seconds after, as waitUntil allows), and returns it. Outside a request there is nothing to keep. */
+export function finish<T>(promise: Promise<T>) {
+  currentContext.getStore()?.waitUntil(promise.catch(() => {}));
+  return promise;
+}
 // The Owner id and the Better Auth instance are immutable once the Owner
 // exists, so an isolate resolves them once instead of per request.
 let owner = '';
@@ -95,11 +105,16 @@ async function buildAuth(env: Bindings, oid: string) {
     plugins: authPlugins(env.APP_ORIGIN, oid),
   });
 }
+/** The Owner's session, and the headers Better Auth answered with. Once it extends the session (every
+ * updateAge), they carry the renewed cookie, which a response has to pass on: the browser's cookie
+ * would otherwise run out a day after the sign-in, however much the session is used. */
 export async function requireOwner(request: Request, env: Bindings, recent = false) {
-  const session = await (await createAuth(env)).api.getSession({ headers: request.headers });
+  const { headers, response: session } = await (
+    await createAuth(env)
+  ).api.getSession({ headers: request.headers, returnHeaders: true });
   assert(session?.user.id && session.user.id === (await ownerId(env)), 'owner_auth_required', 401);
   if (recent) assert(now() - new Date(session.session.createdAt).getTime() < 600_000, 'recent_login_required', 403);
-  return session.user;
+  return { session: session.session, headers };
 }
 export function requireOrigin(request: Request, env: Bindings) {
   assert(request.headers.get('origin') === env.APP_ORIGIN, 'origin_not_allowed', 403);

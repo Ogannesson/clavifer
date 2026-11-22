@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Clavifer REST API",
-    "version": "0.5.0",
+    "version": "0.6.0",
     "description": "Owner administration and Agent resource APIs. Owner routes require the Better Auth session cookie and same-origin writes. Agent routes require an OAuth Bearer token with an installation-specific grant. MCP is a separate Streamable HTTP protocol at /v1/mcp, sharing the /v1 audience. Dynamic client registration is disabled; an Owner creates installation clients through /admin/clients."
   },
   "servers": [
@@ -285,7 +285,7 @@
       "post": {
         "operationId": "startImport",
         "summary": "Start importing a snapshot into an uninitialized instance",
-        "description": "Same origin only. The console decrypts a clavifer-backup-v1 snapshot in the browser and sends its header and owner records here; the rest follow in chunks and a commit. Spends the token issued for an uninitialized instance (valid 24 hours) and in one transaction empties the instance and records the import, whose id the response returns: like the token it grants the import, and it only ever travels in bodies. A header of a later format, or an Owner password derived with other scrypt parameters, is refused with invalid_snapshot; an initialized instance with already_initialized. A new start replaces any import in progress.",
+        "description": "Same origin only. The console decrypts a clavifer-backup-v2 or clavifer-backup-v1 snapshot in the browser and sends its header and owner records here; the rest follow in chunks and a commit, each read in the format the header names. Spends the token issued for an uninitialized instance (valid 24 hours) and in one transaction empties the instance and records the import, whose id the response returns: like the token it grants the import, and it only ever travels in bodies. A header of a later format is refused with snapshot_from_newer_version and an Owner password derived with other scrypt parameters with invalid_snapshot, both before the token is spent; an initialized instance with already_initialized. A new start replaces any import in progress.",
         "parameters": [
           {
             "name": "X-Bootstrap-Token",
@@ -372,7 +372,7 @@
       "post": {
         "operationId": "importChunk",
         "summary": "Write a chunk of snapshot records",
-        "description": "Same origin only. Records of the types secret to segment, each checked against the v1 format, written in one transaction with the chunk seq, so a chunk sent again answers written without writing twice. Only structure and references are checked, never the business rules of this version. Credential versions are encrypted under this instance’s root key; an embedded segment is stored under a new key after its SHA-256 matched. A referenced segment (automatic backup) must be in this instance’s bucket with the checksum its record names; when one is not, nothing is written and missing lists them, and the chunk can be sent again with those in skip to go on without them. An import that is no longer the one in progress is refused with import_superseded, before the body is read when no import is in progress at all. Up to 8 MiB and 64 KiB.",
+        "description": "Same origin only. Records of the types secret to segment, each checked against the format of the import’s header, written in one transaction with the chunk seq, so a chunk sent again answers written without writing twice. Only structure and references are checked, never the business rules of this version; a rule holding a literal { or }, which v2 reads as a wildcard, in a v1 connection or in the setup or update draft of a v1 access request still pending and unexpired is refused with backup_has_unconvertible_rule, and a header format this version does not read (an import a later version started) with snapshot_from_newer_version. Credential versions are encrypted under this instance’s root key; an embedded segment is stored under a new key after its SHA-256 matched. A referenced segment (automatic backup) must be in this instance’s bucket with the checksum its record names; when one is not, nothing is written and missing lists them, and the chunk can be sent again with those in skip to go on without them. An import that is no longer the one in progress is refused with import_superseded, before the body is read when no import is in progress at all. Up to 8 MiB and 64 KiB.",
         "requestBody": {
           "required": true,
           "content": {
@@ -524,6 +524,7 @@
       "get": {
         "operationId": "adminStatus",
         "summary": "Owner dashboard state",
+        "description": "A connection with authorize carries callback, the redirect URI to register at its upstream; a pending setup carries callbacks, those of the connections it creates with authorize, by connection id.",
         "security": [
           {
             "OwnerCookie": []
@@ -1095,6 +1096,210 @@
         }
       }
     },
+    "/admin/connections/{id}/authorize": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ResourceId"
+        }
+      ],
+      "post": {
+        "operationId": "startAuthorization",
+        "summary": "Start authorizing a connection at its upstream",
+        "description": "Requires a login within the last 10 minutes. Only a connection of type oauth-refresh with authorize (authorization_not_configured otherwise) whose client has an id (client_id_required). Answers the authorization URL, with response_type code, the client id, the redirect URI <origin>/oauth/callback/<connection id>, the scope of authorize, a new state, a PKCE S256 challenge and the parameters of authorize, and its host; the console sends the browser there. The state is good for 10 minutes, in this session, for this connection as it is configured now.",
+        "security": [
+          {
+            "OwnerCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authorization URL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "url": {
+                      "type": "string",
+                      "format": "uri"
+                    },
+                    "host": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "url",
+                    "host"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Stable error code and request ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Stable error code and request ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Stable error code and request ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Stable error code and request ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/oauth/complete": {
+      "post": {
+        "operationId": "completeAuthorization",
+        "summary": "Complete an authorization with the code the upstream sent back",
+        "description": "Spends the state whatever the outcome. Refused with authorization_expired when the state is unknown, more than 10 minutes old, spent, was issued to another session or for another connection, or under a root key no longer in the ring, with token_unavailable when another exchange of the credential leaves less than 10 seconds for this one (nothing is sent; start again), and with connection_changed when the connection was changed or deleted since. The code is exchanged at the token endpoint with the PKCE verifier, and the refresh token in the answer is stored as the next version of the credential (the field is added when missing), over any version saved meanwhile; every token cached before ends. An answer without a refresh token stores nothing (no_refresh_token); a refusal of the token endpoint carries what it said in token_endpoint, as saving a connection does. An answer without expires_in for a connection without ttl stores the refresh token and adds a ttl_required warning.",
+        "security": [
+          {
+            "OwnerCookie": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthorizationCompletion"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Authorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "warnings": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "connection": {
+                            "type": "string"
+                          },
+                          "error": {
+                            "type": "string",
+                            "enum": [
+                              "ttl_required"
+                            ]
+                          },
+                          "hint": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "ok"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Stable error code and request ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Stable error code and request ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Stable error code and request ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stable error code and request ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Stable error code and request ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Stable error code and request ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/admin/grants": {
       "post": {
         "operationId": "grantResources",
@@ -1237,7 +1442,7 @@
       "post": {
         "operationId": "decideAccessRequest",
         "summary": "Approve or deny a pending access request",
-        "description": "Approving may only revive a grant that is not live. When a live grant covers the same resource with a different field subset the request is refused with existing_grant_conflict, so the Owner changes the subset in the administration form instead. An approval may set expiresAt (milliseconds, or null until revoked); without it the grant lasts 24 hours. A live grant never loses reach to a shorter expiry. Approving an invocation request ignores the body, unless the invocation names another origin than its connection’s own: then origin has to repeat that origin as stored, or the approval is refused with origin_mismatch. The exact request may run once within 10 minutes. Approving a setup with a credential takes values holding exactly its fields; the credential, every connection and the approval are written in one batch under the ids fixed on submission, so a failure creates none of them; a credential name already taken (also by a deleted credential) is refused with secret_name_taken. Approving an update ignores the body and is refused with connection_changed when the connection changed after submission. Denying ignores the body.",
+        "description": "Approving may only revive a grant that is not live. When a live grant covers the same resource with a different field subset the request is refused with existing_grant_conflict, so the Owner changes the subset in the administration form instead. An approval may set expiresAt (milliseconds, or null until revoked); without it the grant lasts 24 hours. A live grant never loses reach to a shorter expiry. Approving an invocation request ignores the body, unless the invocation names another origin than its connection’s own: then origin has to repeat that origin as stored, or the approval is refused with origin_mismatch. The exact request may run once within 10 minutes. Approving a setup with a credential takes values holding exactly its fields, except that a field only connections with authorize read, as their refresh token, may be left out for authorizing to write; the credential, every connection and the approval are written in one batch under the ids fixed on submission, so a failure creates none of them; a credential name already taken (also by a deleted credential) is refused with secret_name_taken. Approving an update ignores the body and is refused with connection_changed when the connection changed after submission. Denying ignores the body.",
         "security": [
           {
             "OwnerCookie": []
@@ -1325,7 +1530,7 @@
     "/admin/backup/export": {
       "get": {
         "operationId": "fullExport",
-        "summary": "Stream the complete state of the instance as an age-encrypted v1 full snapshot",
+        "summary": "Stream the complete state of the instance as an age-encrypted v2 full snapshot",
         "description": "Requires a login within the last 10 minutes and Sec-Fetch-Site: same-origin (a browser download started by the console itself; anything else is refused with cross_site_request). Every sealed segment is embedded; one missing from the bucket or without the checksum its manifest row recorded refuses the export before the first byte (archive_segment_unavailable), as an inconsistent instance does (backup_has_*). The download is whole only once GET /admin/backup/exports/{id} reports complete: a stream that breaks off still ends cleanly for the client.",
         "security": [
           {
@@ -1353,7 +1558,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Age-encrypted JSON Lines snapshot (clavifer-backup-v1, kind full)",
+            "description": "Age-encrypted JSON Lines snapshot (clavifer-backup-v2, kind full)",
             "content": {
               "application/octet-stream": {
                 "schema": {
@@ -1652,7 +1857,7 @@
       "get": {
         "operationId": "downloadLatestBackup",
         "summary": "Download latest encrypted automatic backup",
-        "description": "A v1 snapshot of kind automatic. It names each sealed segment by its key in the same bucket instead of carrying it, so it is complete only together with that bucket.",
+        "description": "A v2 snapshot of kind automatic. It names each sealed segment by its key in the same bucket instead of carrying it, so it is complete only together with that bucket.",
         "security": [
           {
             "OwnerCookie": []
@@ -1660,7 +1865,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Age-encrypted JSON Lines snapshot (clavifer-backup-v1, kind automatic)",
+            "description": "Age-encrypted JSON Lines snapshot (clavifer-backup-v2, kind automatic)",
             "content": {
               "application/octet-stream": {
                 "schema": {
@@ -2664,6 +2869,1039 @@
                   "name"
                 ],
                 "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "jwt"
+                  },
+                  "secretId": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z0-9_-]{1,100}$"
+                  },
+                  "jwt": {
+                    "type": "object",
+                    "properties": {
+                      "alg": {
+                        "type": "string",
+                        "enum": [
+                          "RS256",
+                          "RS384",
+                          "RS512",
+                          "PS256",
+                          "PS384",
+                          "PS512",
+                          "ES256",
+                          "ES384",
+                          "ES512",
+                          "EdDSA",
+                          "Ed25519",
+                          "HS256",
+                          "HS384",
+                          "HS512"
+                        ]
+                      },
+                      "keyField": {
+                        "type": "string",
+                        "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                      },
+                      "keyEncoding": {
+                        "type": "string",
+                        "enum": [
+                          "utf8",
+                          "base64",
+                          "base64url",
+                          "hex"
+                        ]
+                      },
+                      "header": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 64
+                        },
+                        "additionalProperties": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "maxLength": 4096
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "$field": {
+                                  "type": "string",
+                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                }
+                              },
+                              "required": [
+                                "$field"
+                              ],
+                              "additionalProperties": false
+                            }
+                          ]
+                        }
+                      },
+                      "claims": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "additionalProperties": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "$field": {
+                                  "type": "string",
+                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                }
+                              },
+                              "required": [
+                                "$field"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {}
+                          ]
+                        }
+                      },
+                      "lifetime": {
+                        "type": "integer",
+                        "minimum": 10,
+                        "maximum": 3600
+                      },
+                      "jti": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "alg",
+                      "keyField",
+                      "claims",
+                      "lifetime"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "header": {
+                    "type": "string"
+                  },
+                  "scheme": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9!#$%&'*+.^_`|~-]{0,64}$"
+                  }
+                },
+                "required": [
+                  "type",
+                  "secretId",
+                  "jwt"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "oauth-client"
+                  },
+                  "secretId": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z0-9_-]{1,100}$"
+                  },
+                  "client": {
+                    "oneOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "method": {
+                            "type": "string",
+                            "const": "basic"
+                          },
+                          "id": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1024
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "$field": {
+                                    "type": "string",
+                                    "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                  }
+                                },
+                                "required": [
+                                  "$field"
+                                ],
+                                "additionalProperties": false
+                              }
+                            ]
+                          },
+                          "secretField": {
+                            "type": "string",
+                            "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                          }
+                        },
+                        "required": [
+                          "method",
+                          "id",
+                          "secretField"
+                        ],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "method": {
+                            "type": "string",
+                            "const": "post"
+                          },
+                          "id": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1024
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "$field": {
+                                    "type": "string",
+                                    "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                  }
+                                },
+                                "required": [
+                                  "$field"
+                                ],
+                                "additionalProperties": false
+                              }
+                            ]
+                          },
+                          "secretField": {
+                            "type": "string",
+                            "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                          }
+                        },
+                        "required": [
+                          "method",
+                          "id",
+                          "secretField"
+                        ],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "method": {
+                            "type": "string",
+                            "const": "jwt"
+                          },
+                          "id": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1024
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "$field": {
+                                    "type": "string",
+                                    "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                  }
+                                },
+                                "required": [
+                                  "$field"
+                                ],
+                                "additionalProperties": false
+                              }
+                            ]
+                          },
+                          "jwt": {
+                            "type": "object",
+                            "properties": {
+                              "alg": {
+                                "type": "string",
+                                "enum": [
+                                  "RS256",
+                                  "RS384",
+                                  "RS512",
+                                  "PS256",
+                                  "PS384",
+                                  "PS512",
+                                  "ES256",
+                                  "ES384",
+                                  "ES512",
+                                  "EdDSA",
+                                  "Ed25519",
+                                  "HS256",
+                                  "HS384",
+                                  "HS512"
+                                ]
+                              },
+                              "keyField": {
+                                "type": "string",
+                                "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                              },
+                              "keyEncoding": {
+                                "type": "string",
+                                "enum": [
+                                  "utf8",
+                                  "base64",
+                                  "base64url",
+                                  "hex"
+                                ]
+                              },
+                              "header": {
+                                "type": "object",
+                                "propertyNames": {
+                                  "type": "string",
+                                  "minLength": 1,
+                                  "maxLength": 64
+                                },
+                                "additionalProperties": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string",
+                                      "maxLength": 4096
+                                    },
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "$field": {
+                                          "type": "string",
+                                          "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                        }
+                                      },
+                                      "required": [
+                                        "$field"
+                                      ],
+                                      "additionalProperties": false
+                                    }
+                                  ]
+                                }
+                              },
+                              "claims": {
+                                "type": "object",
+                                "propertyNames": {
+                                  "type": "string",
+                                  "minLength": 1,
+                                  "maxLength": 256
+                                },
+                                "additionalProperties": {
+                                  "anyOf": [
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "$field": {
+                                          "type": "string",
+                                          "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                        }
+                                      },
+                                      "required": [
+                                        "$field"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {}
+                                  ]
+                                }
+                              },
+                              "lifetime": {
+                                "type": "integer",
+                                "minimum": 10,
+                                "maximum": 3600
+                              },
+                              "jti": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "alg",
+                              "keyField",
+                              "claims",
+                              "lifetime"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": [
+                          "method",
+                          "jwt"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "grantType": {
+                    "type": "string",
+                    "pattern": "^[\\x21-\\x7e]{1,256}$"
+                  },
+                  "scope": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  },
+                  "header": {
+                    "type": "string"
+                  },
+                  "scheme": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9!#$%&'*+.^_`|~-]{0,64}$"
+                  },
+                  "tokenUrl": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "format": "uri"
+                  },
+                  "bodyFormat": {
+                    "type": "string",
+                    "enum": [
+                      "form",
+                      "json"
+                    ]
+                  },
+                  "params": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_.:~-]{1,128}$"
+                    },
+                    "additionalProperties": {
+                      "type": "string",
+                      "maxLength": 4096
+                    }
+                  },
+                  "ttl": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 31536000
+                  }
+                },
+                "required": [
+                  "type",
+                  "secretId",
+                  "client",
+                  "tokenUrl"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "oauth-jwt"
+                  },
+                  "secretId": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z0-9_-]{1,100}$"
+                  },
+                  "jwt": {
+                    "type": "object",
+                    "properties": {
+                      "alg": {
+                        "type": "string",
+                        "enum": [
+                          "RS256",
+                          "RS384",
+                          "RS512",
+                          "PS256",
+                          "PS384",
+                          "PS512",
+                          "ES256",
+                          "ES384",
+                          "ES512",
+                          "EdDSA",
+                          "Ed25519",
+                          "HS256",
+                          "HS384",
+                          "HS512"
+                        ]
+                      },
+                      "keyField": {
+                        "type": "string",
+                        "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                      },
+                      "keyEncoding": {
+                        "type": "string",
+                        "enum": [
+                          "utf8",
+                          "base64",
+                          "base64url",
+                          "hex"
+                        ]
+                      },
+                      "header": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 64
+                        },
+                        "additionalProperties": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "maxLength": 4096
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "$field": {
+                                  "type": "string",
+                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                }
+                              },
+                              "required": [
+                                "$field"
+                              ],
+                              "additionalProperties": false
+                            }
+                          ]
+                        }
+                      },
+                      "claims": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "additionalProperties": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "$field": {
+                                  "type": "string",
+                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                }
+                              },
+                              "required": [
+                                "$field"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {}
+                          ]
+                        }
+                      },
+                      "lifetime": {
+                        "type": "integer",
+                        "minimum": 10,
+                        "maximum": 3600
+                      },
+                      "jti": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "alg",
+                      "keyField",
+                      "claims",
+                      "lifetime"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "client": {
+                    "oneOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "method": {
+                            "type": "string",
+                            "const": "basic"
+                          },
+                          "id": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1024
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "$field": {
+                                    "type": "string",
+                                    "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                  }
+                                },
+                                "required": [
+                                  "$field"
+                                ],
+                                "additionalProperties": false
+                              }
+                            ]
+                          },
+                          "secretField": {
+                            "type": "string",
+                            "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                          }
+                        },
+                        "required": [
+                          "method",
+                          "id",
+                          "secretField"
+                        ],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "method": {
+                            "type": "string",
+                            "const": "post"
+                          },
+                          "id": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1024
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "$field": {
+                                    "type": "string",
+                                    "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                  }
+                                },
+                                "required": [
+                                  "$field"
+                                ],
+                                "additionalProperties": false
+                              }
+                            ]
+                          },
+                          "secretField": {
+                            "type": "string",
+                            "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                          }
+                        },
+                        "required": [
+                          "method",
+                          "id",
+                          "secretField"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "header": {
+                    "type": "string"
+                  },
+                  "scheme": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9!#$%&'*+.^_`|~-]{0,64}$"
+                  },
+                  "tokenUrl": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "format": "uri"
+                  },
+                  "bodyFormat": {
+                    "type": "string",
+                    "enum": [
+                      "form",
+                      "json"
+                    ]
+                  },
+                  "params": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_.:~-]{1,128}$"
+                    },
+                    "additionalProperties": {
+                      "type": "string",
+                      "maxLength": 4096
+                    }
+                  },
+                  "ttl": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 31536000
+                  }
+                },
+                "required": [
+                  "type",
+                  "secretId",
+                  "jwt",
+                  "tokenUrl"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "oauth-refresh"
+                  },
+                  "secretId": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z0-9_-]{1,100}$"
+                  },
+                  "refreshField": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                  },
+                  "client": {
+                    "oneOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "method": {
+                            "type": "string",
+                            "const": "basic"
+                          },
+                          "id": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1024
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "$field": {
+                                    "type": "string",
+                                    "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                  }
+                                },
+                                "required": [
+                                  "$field"
+                                ],
+                                "additionalProperties": false
+                              }
+                            ]
+                          },
+                          "secretField": {
+                            "type": "string",
+                            "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                          }
+                        },
+                        "required": [
+                          "method",
+                          "id",
+                          "secretField"
+                        ],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "method": {
+                            "type": "string",
+                            "const": "post"
+                          },
+                          "id": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1024
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "$field": {
+                                    "type": "string",
+                                    "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                  }
+                                },
+                                "required": [
+                                  "$field"
+                                ],
+                                "additionalProperties": false
+                              }
+                            ]
+                          },
+                          "secretField": {
+                            "type": "string",
+                            "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                          }
+                        },
+                        "required": [
+                          "method",
+                          "id",
+                          "secretField"
+                        ],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "method": {
+                            "type": "string",
+                            "const": "jwt"
+                          },
+                          "id": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1024
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "$field": {
+                                    "type": "string",
+                                    "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                  }
+                                },
+                                "required": [
+                                  "$field"
+                                ],
+                                "additionalProperties": false
+                              }
+                            ]
+                          },
+                          "jwt": {
+                            "type": "object",
+                            "properties": {
+                              "alg": {
+                                "type": "string",
+                                "enum": [
+                                  "RS256",
+                                  "RS384",
+                                  "RS512",
+                                  "PS256",
+                                  "PS384",
+                                  "PS512",
+                                  "ES256",
+                                  "ES384",
+                                  "ES512",
+                                  "EdDSA",
+                                  "Ed25519",
+                                  "HS256",
+                                  "HS384",
+                                  "HS512"
+                                ]
+                              },
+                              "keyField": {
+                                "type": "string",
+                                "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                              },
+                              "keyEncoding": {
+                                "type": "string",
+                                "enum": [
+                                  "utf8",
+                                  "base64",
+                                  "base64url",
+                                  "hex"
+                                ]
+                              },
+                              "header": {
+                                "type": "object",
+                                "propertyNames": {
+                                  "type": "string",
+                                  "minLength": 1,
+                                  "maxLength": 64
+                                },
+                                "additionalProperties": {
+                                  "anyOf": [
+                                    {
+                                      "type": "string",
+                                      "maxLength": 4096
+                                    },
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "$field": {
+                                          "type": "string",
+                                          "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                        }
+                                      },
+                                      "required": [
+                                        "$field"
+                                      ],
+                                      "additionalProperties": false
+                                    }
+                                  ]
+                                }
+                              },
+                              "claims": {
+                                "type": "object",
+                                "propertyNames": {
+                                  "type": "string",
+                                  "minLength": 1,
+                                  "maxLength": 256
+                                },
+                                "additionalProperties": {
+                                  "anyOf": [
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "$field": {
+                                          "type": "string",
+                                          "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                        }
+                                      },
+                                      "required": [
+                                        "$field"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {}
+                                  ]
+                                }
+                              },
+                              "lifetime": {
+                                "type": "integer",
+                                "minimum": 10,
+                                "maximum": 3600
+                              },
+                              "jti": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "alg",
+                              "keyField",
+                              "claims",
+                              "lifetime"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": [
+                          "method",
+                          "jwt"
+                        ],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "method": {
+                            "type": "string",
+                            "const": "none"
+                          },
+                          "id": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1024
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "$field": {
+                                    "type": "string",
+                                    "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                  }
+                                },
+                                "required": [
+                                  "$field"
+                                ],
+                                "additionalProperties": false
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "method"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "scope": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  },
+                  "authorize": {
+                    "type": "object",
+                    "properties": {
+                      "url": {
+                        "type": "string",
+                        "maxLength": 2048,
+                        "format": "uri"
+                      },
+                      "scope": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4096
+                      },
+                      "params": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z0-9_.:~-]{1,128}$"
+                        },
+                        "additionalProperties": {
+                          "type": "string",
+                          "maxLength": 4096
+                        }
+                      }
+                    },
+                    "required": [
+                      "url"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "header": {
+                    "type": "string"
+                  },
+                  "scheme": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9!#$%&'*+.^_`|~-]{0,64}$"
+                  },
+                  "tokenUrl": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "format": "uri"
+                  },
+                  "bodyFormat": {
+                    "type": "string",
+                    "enum": [
+                      "form",
+                      "json"
+                    ]
+                  },
+                  "params": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_.:~-]{1,128}$"
+                    },
+                    "additionalProperties": {
+                      "type": "string",
+                      "maxLength": 4096
+                    }
+                  },
+                  "ttl": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 31536000
+                  }
+                },
+                "required": [
+                  "type",
+                  "secretId",
+                  "refreshField",
+                  "client",
+                  "tokenUrl"
+                ],
+                "additionalProperties": false
               }
             ]
           }
@@ -3206,6 +4444,1019 @@
                                 "name"
                               ],
                               "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string",
+                                  "const": "jwt"
+                                },
+                                "jwt": {
+                                  "type": "object",
+                                  "properties": {
+                                    "alg": {
+                                      "type": "string",
+                                      "enum": [
+                                        "RS256",
+                                        "RS384",
+                                        "RS512",
+                                        "PS256",
+                                        "PS384",
+                                        "PS512",
+                                        "ES256",
+                                        "ES384",
+                                        "ES512",
+                                        "EdDSA",
+                                        "Ed25519",
+                                        "HS256",
+                                        "HS384",
+                                        "HS512"
+                                      ]
+                                    },
+                                    "keyField": {
+                                      "type": "string",
+                                      "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                    },
+                                    "keyEncoding": {
+                                      "type": "string",
+                                      "enum": [
+                                        "utf8",
+                                        "base64",
+                                        "base64url",
+                                        "hex"
+                                      ]
+                                    },
+                                    "header": {
+                                      "type": "object",
+                                      "propertyNames": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 64
+                                      },
+                                      "additionalProperties": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string",
+                                            "maxLength": 4096
+                                          },
+                                          {
+                                            "type": "object",
+                                            "properties": {
+                                              "$field": {
+                                                "type": "string",
+                                                "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                              }
+                                            },
+                                            "required": [
+                                              "$field"
+                                            ],
+                                            "additionalProperties": false
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    "claims": {
+                                      "type": "object",
+                                      "propertyNames": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 256
+                                      },
+                                      "additionalProperties": {
+                                        "anyOf": [
+                                          {
+                                            "type": "object",
+                                            "properties": {
+                                              "$field": {
+                                                "type": "string",
+                                                "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                              }
+                                            },
+                                            "required": [
+                                              "$field"
+                                            ],
+                                            "additionalProperties": false
+                                          },
+                                          {}
+                                        ]
+                                      }
+                                    },
+                                    "lifetime": {
+                                      "type": "integer",
+                                      "minimum": 10,
+                                      "maximum": 3600
+                                    },
+                                    "jti": {
+                                      "type": "boolean"
+                                    }
+                                  },
+                                  "required": [
+                                    "alg",
+                                    "keyField",
+                                    "claims",
+                                    "lifetime"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "header": {
+                                  "type": "string"
+                                },
+                                "scheme": {
+                                  "type": "string",
+                                  "pattern": "^[A-Za-z0-9!#$%&'*+.^_`|~-]{0,64}$"
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "jwt"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string",
+                                  "const": "oauth-client"
+                                },
+                                "client": {
+                                  "oneOf": [
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "method": {
+                                          "type": "string",
+                                          "const": "basic"
+                                        },
+                                        "id": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "minLength": 1,
+                                              "maxLength": 1024
+                                            },
+                                            {
+                                              "type": "object",
+                                              "properties": {
+                                                "$field": {
+                                                  "type": "string",
+                                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                }
+                                              },
+                                              "required": [
+                                                "$field"
+                                              ],
+                                              "additionalProperties": false
+                                            }
+                                          ]
+                                        },
+                                        "secretField": {
+                                          "type": "string",
+                                          "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                        }
+                                      },
+                                      "required": [
+                                        "method",
+                                        "id",
+                                        "secretField"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "method": {
+                                          "type": "string",
+                                          "const": "post"
+                                        },
+                                        "id": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "minLength": 1,
+                                              "maxLength": 1024
+                                            },
+                                            {
+                                              "type": "object",
+                                              "properties": {
+                                                "$field": {
+                                                  "type": "string",
+                                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                }
+                                              },
+                                              "required": [
+                                                "$field"
+                                              ],
+                                              "additionalProperties": false
+                                            }
+                                          ]
+                                        },
+                                        "secretField": {
+                                          "type": "string",
+                                          "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                        }
+                                      },
+                                      "required": [
+                                        "method",
+                                        "id",
+                                        "secretField"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "method": {
+                                          "type": "string",
+                                          "const": "jwt"
+                                        },
+                                        "id": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "minLength": 1,
+                                              "maxLength": 1024
+                                            },
+                                            {
+                                              "type": "object",
+                                              "properties": {
+                                                "$field": {
+                                                  "type": "string",
+                                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                }
+                                              },
+                                              "required": [
+                                                "$field"
+                                              ],
+                                              "additionalProperties": false
+                                            }
+                                          ]
+                                        },
+                                        "jwt": {
+                                          "type": "object",
+                                          "properties": {
+                                            "alg": {
+                                              "type": "string",
+                                              "enum": [
+                                                "RS256",
+                                                "RS384",
+                                                "RS512",
+                                                "PS256",
+                                                "PS384",
+                                                "PS512",
+                                                "ES256",
+                                                "ES384",
+                                                "ES512",
+                                                "EdDSA",
+                                                "Ed25519",
+                                                "HS256",
+                                                "HS384",
+                                                "HS512"
+                                              ]
+                                            },
+                                            "keyField": {
+                                              "type": "string",
+                                              "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                            },
+                                            "keyEncoding": {
+                                              "type": "string",
+                                              "enum": [
+                                                "utf8",
+                                                "base64",
+                                                "base64url",
+                                                "hex"
+                                              ]
+                                            },
+                                            "header": {
+                                              "type": "object",
+                                              "propertyNames": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "maxLength": 64
+                                              },
+                                              "additionalProperties": {
+                                                "anyOf": [
+                                                  {
+                                                    "type": "string",
+                                                    "maxLength": 4096
+                                                  },
+                                                  {
+                                                    "type": "object",
+                                                    "properties": {
+                                                      "$field": {
+                                                        "type": "string",
+                                                        "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                      }
+                                                    },
+                                                    "required": [
+                                                      "$field"
+                                                    ],
+                                                    "additionalProperties": false
+                                                  }
+                                                ]
+                                              }
+                                            },
+                                            "claims": {
+                                              "type": "object",
+                                              "propertyNames": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "maxLength": 256
+                                              },
+                                              "additionalProperties": {
+                                                "anyOf": [
+                                                  {
+                                                    "type": "object",
+                                                    "properties": {
+                                                      "$field": {
+                                                        "type": "string",
+                                                        "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                      }
+                                                    },
+                                                    "required": [
+                                                      "$field"
+                                                    ],
+                                                    "additionalProperties": false
+                                                  },
+                                                  {}
+                                                ]
+                                              }
+                                            },
+                                            "lifetime": {
+                                              "type": "integer",
+                                              "minimum": 10,
+                                              "maximum": 3600
+                                            },
+                                            "jti": {
+                                              "type": "boolean"
+                                            }
+                                          },
+                                          "required": [
+                                            "alg",
+                                            "keyField",
+                                            "claims",
+                                            "lifetime"
+                                          ],
+                                          "additionalProperties": false
+                                        }
+                                      },
+                                      "required": [
+                                        "method",
+                                        "jwt"
+                                      ],
+                                      "additionalProperties": false
+                                    }
+                                  ]
+                                },
+                                "grantType": {
+                                  "type": "string",
+                                  "pattern": "^[\\x21-\\x7e]{1,256}$"
+                                },
+                                "scope": {
+                                  "type": "string",
+                                  "minLength": 1,
+                                  "maxLength": 4096
+                                },
+                                "header": {
+                                  "type": "string"
+                                },
+                                "scheme": {
+                                  "type": "string",
+                                  "pattern": "^[A-Za-z0-9!#$%&'*+.^_`|~-]{0,64}$"
+                                },
+                                "tokenUrl": {
+                                  "type": "string",
+                                  "maxLength": 2048,
+                                  "format": "uri"
+                                },
+                                "bodyFormat": {
+                                  "type": "string",
+                                  "enum": [
+                                    "form",
+                                    "json"
+                                  ]
+                                },
+                                "params": {
+                                  "type": "object",
+                                  "propertyNames": {
+                                    "type": "string",
+                                    "pattern": "^[A-Za-z0-9_.:~-]{1,128}$"
+                                  },
+                                  "additionalProperties": {
+                                    "type": "string",
+                                    "maxLength": 4096
+                                  }
+                                },
+                                "ttl": {
+                                  "type": "integer",
+                                  "minimum": 1,
+                                  "maximum": 31536000
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "client",
+                                "tokenUrl"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string",
+                                  "const": "oauth-jwt"
+                                },
+                                "jwt": {
+                                  "type": "object",
+                                  "properties": {
+                                    "alg": {
+                                      "type": "string",
+                                      "enum": [
+                                        "RS256",
+                                        "RS384",
+                                        "RS512",
+                                        "PS256",
+                                        "PS384",
+                                        "PS512",
+                                        "ES256",
+                                        "ES384",
+                                        "ES512",
+                                        "EdDSA",
+                                        "Ed25519",
+                                        "HS256",
+                                        "HS384",
+                                        "HS512"
+                                      ]
+                                    },
+                                    "keyField": {
+                                      "type": "string",
+                                      "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                    },
+                                    "keyEncoding": {
+                                      "type": "string",
+                                      "enum": [
+                                        "utf8",
+                                        "base64",
+                                        "base64url",
+                                        "hex"
+                                      ]
+                                    },
+                                    "header": {
+                                      "type": "object",
+                                      "propertyNames": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 64
+                                      },
+                                      "additionalProperties": {
+                                        "anyOf": [
+                                          {
+                                            "type": "string",
+                                            "maxLength": 4096
+                                          },
+                                          {
+                                            "type": "object",
+                                            "properties": {
+                                              "$field": {
+                                                "type": "string",
+                                                "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                              }
+                                            },
+                                            "required": [
+                                              "$field"
+                                            ],
+                                            "additionalProperties": false
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    "claims": {
+                                      "type": "object",
+                                      "propertyNames": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 256
+                                      },
+                                      "additionalProperties": {
+                                        "anyOf": [
+                                          {
+                                            "type": "object",
+                                            "properties": {
+                                              "$field": {
+                                                "type": "string",
+                                                "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                              }
+                                            },
+                                            "required": [
+                                              "$field"
+                                            ],
+                                            "additionalProperties": false
+                                          },
+                                          {}
+                                        ]
+                                      }
+                                    },
+                                    "lifetime": {
+                                      "type": "integer",
+                                      "minimum": 10,
+                                      "maximum": 3600
+                                    },
+                                    "jti": {
+                                      "type": "boolean"
+                                    }
+                                  },
+                                  "required": [
+                                    "alg",
+                                    "keyField",
+                                    "claims",
+                                    "lifetime"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "client": {
+                                  "oneOf": [
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "method": {
+                                          "type": "string",
+                                          "const": "basic"
+                                        },
+                                        "id": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "minLength": 1,
+                                              "maxLength": 1024
+                                            },
+                                            {
+                                              "type": "object",
+                                              "properties": {
+                                                "$field": {
+                                                  "type": "string",
+                                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                }
+                                              },
+                                              "required": [
+                                                "$field"
+                                              ],
+                                              "additionalProperties": false
+                                            }
+                                          ]
+                                        },
+                                        "secretField": {
+                                          "type": "string",
+                                          "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                        }
+                                      },
+                                      "required": [
+                                        "method",
+                                        "id",
+                                        "secretField"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "method": {
+                                          "type": "string",
+                                          "const": "post"
+                                        },
+                                        "id": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "minLength": 1,
+                                              "maxLength": 1024
+                                            },
+                                            {
+                                              "type": "object",
+                                              "properties": {
+                                                "$field": {
+                                                  "type": "string",
+                                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                }
+                                              },
+                                              "required": [
+                                                "$field"
+                                              ],
+                                              "additionalProperties": false
+                                            }
+                                          ]
+                                        },
+                                        "secretField": {
+                                          "type": "string",
+                                          "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                        }
+                                      },
+                                      "required": [
+                                        "method",
+                                        "id",
+                                        "secretField"
+                                      ],
+                                      "additionalProperties": false
+                                    }
+                                  ]
+                                },
+                                "header": {
+                                  "type": "string"
+                                },
+                                "scheme": {
+                                  "type": "string",
+                                  "pattern": "^[A-Za-z0-9!#$%&'*+.^_`|~-]{0,64}$"
+                                },
+                                "tokenUrl": {
+                                  "type": "string",
+                                  "maxLength": 2048,
+                                  "format": "uri"
+                                },
+                                "bodyFormat": {
+                                  "type": "string",
+                                  "enum": [
+                                    "form",
+                                    "json"
+                                  ]
+                                },
+                                "params": {
+                                  "type": "object",
+                                  "propertyNames": {
+                                    "type": "string",
+                                    "pattern": "^[A-Za-z0-9_.:~-]{1,128}$"
+                                  },
+                                  "additionalProperties": {
+                                    "type": "string",
+                                    "maxLength": 4096
+                                  }
+                                },
+                                "ttl": {
+                                  "type": "integer",
+                                  "minimum": 1,
+                                  "maximum": 31536000
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "jwt",
+                                "tokenUrl"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string",
+                                  "const": "oauth-refresh"
+                                },
+                                "refreshField": {
+                                  "type": "string",
+                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                },
+                                "client": {
+                                  "oneOf": [
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "method": {
+                                          "type": "string",
+                                          "const": "basic"
+                                        },
+                                        "id": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "minLength": 1,
+                                              "maxLength": 1024
+                                            },
+                                            {
+                                              "type": "object",
+                                              "properties": {
+                                                "$field": {
+                                                  "type": "string",
+                                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                }
+                                              },
+                                              "required": [
+                                                "$field"
+                                              ],
+                                              "additionalProperties": false
+                                            }
+                                          ]
+                                        },
+                                        "secretField": {
+                                          "type": "string",
+                                          "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                        }
+                                      },
+                                      "required": [
+                                        "method",
+                                        "id",
+                                        "secretField"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "method": {
+                                          "type": "string",
+                                          "const": "post"
+                                        },
+                                        "id": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "minLength": 1,
+                                              "maxLength": 1024
+                                            },
+                                            {
+                                              "type": "object",
+                                              "properties": {
+                                                "$field": {
+                                                  "type": "string",
+                                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                }
+                                              },
+                                              "required": [
+                                                "$field"
+                                              ],
+                                              "additionalProperties": false
+                                            }
+                                          ]
+                                        },
+                                        "secretField": {
+                                          "type": "string",
+                                          "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                        }
+                                      },
+                                      "required": [
+                                        "method",
+                                        "id",
+                                        "secretField"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "method": {
+                                          "type": "string",
+                                          "const": "jwt"
+                                        },
+                                        "id": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "minLength": 1,
+                                              "maxLength": 1024
+                                            },
+                                            {
+                                              "type": "object",
+                                              "properties": {
+                                                "$field": {
+                                                  "type": "string",
+                                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                }
+                                              },
+                                              "required": [
+                                                "$field"
+                                              ],
+                                              "additionalProperties": false
+                                            }
+                                          ]
+                                        },
+                                        "jwt": {
+                                          "type": "object",
+                                          "properties": {
+                                            "alg": {
+                                              "type": "string",
+                                              "enum": [
+                                                "RS256",
+                                                "RS384",
+                                                "RS512",
+                                                "PS256",
+                                                "PS384",
+                                                "PS512",
+                                                "ES256",
+                                                "ES384",
+                                                "ES512",
+                                                "EdDSA",
+                                                "Ed25519",
+                                                "HS256",
+                                                "HS384",
+                                                "HS512"
+                                              ]
+                                            },
+                                            "keyField": {
+                                              "type": "string",
+                                              "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                            },
+                                            "keyEncoding": {
+                                              "type": "string",
+                                              "enum": [
+                                                "utf8",
+                                                "base64",
+                                                "base64url",
+                                                "hex"
+                                              ]
+                                            },
+                                            "header": {
+                                              "type": "object",
+                                              "propertyNames": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "maxLength": 64
+                                              },
+                                              "additionalProperties": {
+                                                "anyOf": [
+                                                  {
+                                                    "type": "string",
+                                                    "maxLength": 4096
+                                                  },
+                                                  {
+                                                    "type": "object",
+                                                    "properties": {
+                                                      "$field": {
+                                                        "type": "string",
+                                                        "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                      }
+                                                    },
+                                                    "required": [
+                                                      "$field"
+                                                    ],
+                                                    "additionalProperties": false
+                                                  }
+                                                ]
+                                              }
+                                            },
+                                            "claims": {
+                                              "type": "object",
+                                              "propertyNames": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "maxLength": 256
+                                              },
+                                              "additionalProperties": {
+                                                "anyOf": [
+                                                  {
+                                                    "type": "object",
+                                                    "properties": {
+                                                      "$field": {
+                                                        "type": "string",
+                                                        "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                      }
+                                                    },
+                                                    "required": [
+                                                      "$field"
+                                                    ],
+                                                    "additionalProperties": false
+                                                  },
+                                                  {}
+                                                ]
+                                              }
+                                            },
+                                            "lifetime": {
+                                              "type": "integer",
+                                              "minimum": 10,
+                                              "maximum": 3600
+                                            },
+                                            "jti": {
+                                              "type": "boolean"
+                                            }
+                                          },
+                                          "required": [
+                                            "alg",
+                                            "keyField",
+                                            "claims",
+                                            "lifetime"
+                                          ],
+                                          "additionalProperties": false
+                                        }
+                                      },
+                                      "required": [
+                                        "method",
+                                        "jwt"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "method": {
+                                          "type": "string",
+                                          "const": "none"
+                                        },
+                                        "id": {
+                                          "anyOf": [
+                                            {
+                                              "type": "string",
+                                              "minLength": 1,
+                                              "maxLength": 1024
+                                            },
+                                            {
+                                              "type": "object",
+                                              "properties": {
+                                                "$field": {
+                                                  "type": "string",
+                                                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"
+                                                }
+                                              },
+                                              "required": [
+                                                "$field"
+                                              ],
+                                              "additionalProperties": false
+                                            }
+                                          ]
+                                        }
+                                      },
+                                      "required": [
+                                        "method"
+                                      ],
+                                      "additionalProperties": false
+                                    }
+                                  ]
+                                },
+                                "scope": {
+                                  "type": "string",
+                                  "minLength": 1,
+                                  "maxLength": 4096
+                                },
+                                "authorize": {
+                                  "type": "object",
+                                  "properties": {
+                                    "url": {
+                                      "type": "string",
+                                      "maxLength": 2048,
+                                      "format": "uri"
+                                    },
+                                    "scope": {
+                                      "type": "string",
+                                      "minLength": 1,
+                                      "maxLength": 4096
+                                    },
+                                    "params": {
+                                      "type": "object",
+                                      "propertyNames": {
+                                        "type": "string",
+                                        "pattern": "^[A-Za-z0-9_.:~-]{1,128}$"
+                                      },
+                                      "additionalProperties": {
+                                        "type": "string",
+                                        "maxLength": 4096
+                                      }
+                                    }
+                                  },
+                                  "required": [
+                                    "url"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "header": {
+                                  "type": "string"
+                                },
+                                "scheme": {
+                                  "type": "string",
+                                  "pattern": "^[A-Za-z0-9!#$%&'*+.^_`|~-]{0,64}$"
+                                },
+                                "tokenUrl": {
+                                  "type": "string",
+                                  "maxLength": 2048,
+                                  "format": "uri"
+                                },
+                                "bodyFormat": {
+                                  "type": "string",
+                                  "enum": [
+                                    "form",
+                                    "json"
+                                  ]
+                                },
+                                "params": {
+                                  "type": "object",
+                                  "propertyNames": {
+                                    "type": "string",
+                                    "pattern": "^[A-Za-z0-9_.:~-]{1,128}$"
+                                  },
+                                  "additionalProperties": {
+                                    "type": "string",
+                                    "maxLength": 4096
+                                  }
+                                },
+                                "ttl": {
+                                  "type": "integer",
+                                  "minimum": 1,
+                                  "maximum": 31536000
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "refreshField",
+                                "client",
+                                "tokenUrl"
+                              ],
+                              "additionalProperties": false
                             }
                           ]
                         },
@@ -3450,6 +5701,31 @@
             "type": "string"
           }
         },
+        "additionalProperties": false
+      },
+      "AuthorizationCompletion": {
+        "type": "object",
+        "properties": {
+          "connection": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,100}$"
+          },
+          "state": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "connection",
+          "state",
+          "code"
+        ],
         "additionalProperties": false
       },
       "BackupConfigInput": {

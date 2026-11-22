@@ -183,7 +183,7 @@ Verify: Within 60 seconds, this request answers as shown.
 curl -sS --noproxy localhost http://localhost:8787/healthz
 ```
 
-In a new checkout it prints `{"ok":true,"service":"clavifer","version":"0.5.0","keys":"uninitialized","initialized":false}`. `version` is the version of the code that is running; this release is 0.5.0. In a checkout that already has an Owner it prints `"keys":"ok"` and `"initialized":true`, and Step A6 is then skipped.
+In a new checkout it prints `{"ok":true,"service":"clavifer","version":"0.6.0","keys":"uninitialized","initialized":false}`. `version` is the version of the code that is running; this release is 0.6.0. In a checkout that already has an Owner it prints `"keys":"ok"` and `"initialized":true`, and Step A6 is then skipped.
 
 The local configuration fixes the origin to `http://localhost:8787`. The console works only at exactly this address: not at the numeric loopback address, and not on another port. The `Ready on` line in wrangler's startup log shows the numeric loopback address; do not copy the address from the log when you tell the human where to go.
 
@@ -572,7 +572,7 @@ The deploy entry does the following, in this order, and stops at the first refus
 
 On a first deployment the command can run for more than 10 minutes while Cloudflare issues the certificate for the hostname. Give it a timeout of at least 15 minutes, or run it in the background and wait until it exits.
 
-Verify: The command exits with status 0 and prints no secret value. Between wrangler's own output, it prints `Stored a new ROOT_KEY on the Worker; it exists nowhere else.` (only on the run that stores the key) and `Bootstrap token written to work/production-bootstrap.token; open /setup and enter it there.` Its last line is `https://<HOSTNAME> runs 0.5.0, uninitialized.` An existence check on `work/production-bootstrap.token` prints `True`.
+Verify: The command exits with status 0 and prints no secret value. Between wrangler's own output, it prints `Stored a new ROOT_KEY on the Worker; it exists nowhere else.` (only on the run that stores the key) and `Bootstrap token written to work/production-bootstrap.token; open /setup and enter it there.` Its last line is `https://<HOSTNAME> runs 0.6.0, uninitialized.` An existence check on `work/production-bootstrap.token` prints `True`.
 
 Rerun: Safe. Each run reads the live state again. A run after a failure continues where the earlier one stopped: it does not generate a second key for a Worker that has one, and while the instance has no Owner it issues a new token, which replaces the earlier one and its file. Once the Owner exists, a run deploys the checked-out code without a token, as in [Upgrading](#upgrading).
 
@@ -805,6 +805,8 @@ The version to upgrade to is the latest commit of `origin/main`. The project has
 
 0.5.0 is the first release. An instance whose `/healthz` answer has no `keys` field was deployed from a pre-release commit of the repository, even if it reports `version` 0.5.0, and cannot be upgraded in place: 0.5.0 replaces its Worker secrets with `ROOT_KEY` and starts the database schema anew. Do not deploy 0.5.0 over it. If its 备份 (backup) page offers 完整导出 (full export), import that export into a new 0.5.0 instance, as described under [Migrating to a new instance](#migrating-to-a-new-instance). Otherwise deploy a new instance with Part B, and the human enters the data again.
 
+From 0.6.0 on, rules read `{` and `}` as wildcards, where 0.5.0 read them as literal characters. The migration `0002_token_auth.sql` therefore fails while a deny, approval or free rule holds a literal `{` or `}`, in a connection or in a setup or update draft that is still pending. Step U3 then stops at `d1 migrations apply`, its output names the constraint `rules_hold_no_literal_brace`, and the new code is not deployed. Ask the human to rewrite each such connection rule with `%7B` and `%7D` in the console of the running version, and to deny each such draft. Then run Step U3 again.
+
 Steps U1 to U3 are Agent steps. In Step U4 the human installs the client. With a staging environment, perform Steps U1 and U2 once, Step U3 for staging, then Step U3 for production, and Step U4 once, after every environment is upgraded.
 
 ### Step U1: Get the new code
@@ -885,6 +887,7 @@ A hostname can be attached to only one Worker at a time. To move the service to 
 2. Run `npm run deploy -- --env production`. It checks that the new hostname is free, as in Step 2.6, and waits until the service answers on it. Then perform Step 2.7 for the new hostname.
 3. The human signs in at the new hostname with the password and registers every Passkey again. A Passkey is bound to the hostname it was registered on.
 4. Log in again with every profile, as in the login step of [clients.md](clients.md), with the new address as `<SERVER>`. The client ID stays the same.
+5. Every connection that [authorizes at its upstream](connections.md#authorizing-a-connection) has a new callback address on the new hostname. The human registers it with the upstream's OAuth client before authorizing the connection again.
 
 When a hostname moves from one environment to another, deploy the environment that gives it up first, confirm that the hostname no longer answers, and then deploy the environment that takes it.
 
@@ -955,7 +958,7 @@ The files under `work/`, the branch `deploy`, and the logins on client machines 
 What the service does, as implemented:
 
 - Every 15 minutes the Worker's scheduled run first seals old records, then checks whether a backup is due. It writes a new automatic backup to the bucket under `vault/` when anything the backup carries has changed since the last successful backup, when the recipient has changed, or when the last successful backup is 24 hours old.
-- An automatic backup is a snapshot in the format `clavifer-backup-v1`. It holds the Owner with the password hash and the Passkeys, every secret (an active one with its versions up to the current one; a deleted secret carries no versions), the connections, installations and grants, the access requests and audit rows that are still in the database, the backup recipient, and the key that sealed records are encrypted with. Sealed records are not in it: it names each sealed file by its key in the same bucket. Sessions and tokens are not carried.
+- An automatic backup is a snapshot in the format `clavifer-backup-v2`. An import also reads files in the format `clavifer-backup-v1` that 0.5.0 wrote. It holds the Owner with the password hash and the Passkeys, every secret (an active one with its versions up to the current one; a deleted secret carries no versions), the connections, installations and grants, the access requests and audit rows that are still in the database, the backup recipient, and the key that sealed records are encrypted with. Sealed records are not in it: it names each sealed file by its key in the same bucket. Sessions and tokens are not carried.
 - A snapshot is encrypted to the age recipient before it leaves the Worker. It does not depend on `ROOT_KEY`: an import encrypts every secret again under the key of the instance it goes into.
 - After each successful backup the Worker deletes older copies under `vault/`. It keeps the newest copy of each of the last 30 days and the newest copy of each of the 12 months before that.
 - Audit rows older than five minutes and access requests older than 25 hours are sealed: once the sealable rows of one kind exceed about 1.5 MB, they move out of the database into files of about 1 MB under `archive/` in the same bucket, encrypted to the instance's archive key, an age key generated together with the Owner or carried over by an import. Nothing under `archive/` is ever overwritten or deleted. The archive key is a post-quantum key, but every snapshot carries it, so the sealed records are protected no better than the snapshots: by the backup recipient, or the recipient of a full export. The key pair the console generates is X25519, not post-quantum; for post-quantum protection use a recipient that starts with `age1pq1`.
@@ -1004,6 +1007,9 @@ A migration moves everything an instance holds into a new instance that has no O
 
 4. Passkeys are carried over only when the new hostname is the same as the old one. Otherwise perform Step 3.2. Then perform Step 3.3; the backup recipient comes from the export.
 5. Every installation keeps its client ID. Log in again with every profile, as in the login step of [clients.md](clients.md), with the new address as `<SERVER>`. Web-based MCP clients authorize again.
+6. Connections that [authorize at their upstream](connections.md#authorizing-a-connection) need the human. Say to the human:
+
+   > Connections whose refresh token rotates may hold one that the old instance has replaced since the export. If such a connection answers `token_exchange_failed`, authorize it again on API 连接 (API connections). If the new instance has another hostname, each such connection has a new callback address, shown on the connection: register it with the upstream's OAuth client before you authorize.
 
 The old environment stays as it is until the human decides to remove it, as described under [Removing a deployment](#removing-a-deployment).
 
@@ -1047,7 +1053,7 @@ If the Cloudflare account itself is lost, this procedure does not help; only a f
 
    The deploy entry checks `/healthz` again and refuses unless it reports the key lost or wrangler reports every database the Worker is bound to as deleted, and it refuses a database that already holds an instance. It then binds the Worker to the new database, stores a new `ROOT_KEY`, applies the migrations, deploys, issues a token, and waits for `/healthz`. Give it the same timeout as in Step 2.6.
 
-   Verify: The command exits with status 0. It prints `Stored a new ROOT_KEY on the Worker; it exists nowhere else.`, the line with the token file, `https://<HOSTNAME> runs 0.5.0, uninitialized.`, and `Latest automatic backup: ` followed by the key of the newest object under `vault/`, with a command to fetch it.
+   Verify: The command exits with status 0. It prints `Stored a new ROOT_KEY on the Worker; it exists nowhere else.`, the line with the token file, `https://<HOSTNAME> runs 0.6.0, uninitialized.`, and `Latest automatic backup: ` followed by the key of the newest object under `vault/`, with a command to fetch it.
 
    The newest object is normally `<OBJECT_KEY>`. If it differs, use `<OBJECT_KEY>`: a newer object can be one encrypted to an earlier recipient, written while the recipient was being changed, which the instance never recorded as a backup. After a deleted database, point 2 was skipped: use the newest object as `<OBJECT_KEY>`, and if the page in point 6 cannot decrypt it with the current backup private key, fetch the next older object under `vault/` and try again. Keys under `vault/` sort by the time of the backup. wrangler has no command that lists objects, so ask the human to read the next older key from the bucket's object list in the Cloudflare dashboard.
 
@@ -1068,6 +1074,9 @@ If the Cloudflare account itself is lost, this procedure does not help; only a f
    Verify as in that point.
 
 7. The hostname is unchanged, so the Passkeys come back with the backup. Every agent host logs in again: log in with every profile, as in the login step of [clients.md](clients.md), with the same `<SERVER>`. The client IDs stay the same.
+8. A refresh token that the upstream rotated after the backup was taken is no longer valid. Say to the human:
+
+   > Connections that authorize at their upstream may hold a refresh token older than the last rotation. If such a connection answers `token_exchange_failed`, authorize it again on API 连接 (API connections). The callback addresses are unchanged.
 
 The old database, if it still exists, stays as it is, and `work/production-restore.age` stays in the checkout. Deleting either is the human's decision.
 

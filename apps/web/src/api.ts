@@ -1,4 +1,6 @@
 // Every management call goes through here so error codes reach the user as one consistent sentence.
+import { authorizes, type Auth, type DraftAuth } from '../../../packages/core/auth';
+
 export type Secret = {
   id: string;
   name: string;
@@ -7,12 +9,8 @@ export type Secret = {
   updated_at: number;
   fields: string[];
 };
-export type ConnectionAuth =
-  | { type: 'none' }
-  | { type: 'bearer'; secretId: string; field: string }
-  | { type: 'header'; secretId: string; field: string; name: string }
-  | { type: 'basic'; secretId: string; usernameField: string; passwordField: string }
-  | { type: 'query'; secretId: string; field: string; name: string };
+export type ConnectionAuth = Auth;
+export type { DraftAuth };
 export type Connection = {
   id: string;
   name: string;
@@ -21,6 +19,8 @@ export type Connection = {
   auth_json: string;
   policy_json: string;
   updated_at: number;
+  /** For a connection the Owner authorizes in the console: the address to register upstream. */
+  callback?: string;
 };
 export type ConnectionPolicy = {
   paths: string[];
@@ -66,10 +66,6 @@ export type Invocation = {
 /** A request an Agent's draft policy was tested with; expect is run or a refusal code. */
 export type PolicyTest = { method: string; path: string; grant: boolean; expect: string };
 export type DraftPolicy = Required<Omit<ConnectionPolicy, 'hosts' | 'anyHost'>>;
-// Each auth type on its own, so the type narrows after dropping secretId.
-type WithoutSecretId<A> = A extends unknown ? Omit<A, 'secretId'> : never;
-/** How a connection injects its credential, without which credential: a draft names none yet. */
-export type DraftAuth = WithoutSecretId<ConnectionAuth>;
 /** A credential (field names only) and the connections using it that an Agent proposes, each with its
  * own tests; the Owner enters the values. */
 export type Setup = {
@@ -99,7 +95,14 @@ export type Pending = {
    * connection as it is now: the extra host covering it, if any, and whether the connection reaches any
    * host. The server works it out; hostname is as URL writes it (punycode). */
   elsewhere?: { hostname: string; host: string | null; anyHost: boolean };
+  /** For a setup: the callback of each connection it creates that the Owner authorizes, by its id. */
+  callbacks?: Record<string, string>;
 };
+/** What a token endpoint answered when it refused, as the Owner's routes pass it on: its host always,
+ * the rest when it answered. */
+export type TokenEndpoint = { host?: string; status?: number; error?: string; error_description?: string };
+/** A connection of an approved setup or a completed authorization that still needs the Owner. */
+export type Warning = { connection: string; error: string; hint?: string; token_endpoint?: TokenEndpoint };
 export type AuditEvent = {
   action: string;
   client_id: string | null;
@@ -153,20 +156,47 @@ const errorText: Record<string, string> = {
   already_initialized: '本服务已经有管理员，请直接登录；忘记密码时用找回令牌重置。',
   not_initialized: '本服务还没有管理员，这个令牌只能用来创建管理员或导入快照。',
   invalid_snapshot: '快照文件不符合格式，无法导入。',
+  snapshot_from_newer_version:
+    '这份快照由更新版本的 Clavifer 写出，本服务读不了。请先把本服务升级到同一或更新的版本，再导入。',
+  backup_has_unconvertible_rule:
+    '快照里有连接的规则含字面的 { 或 }。本版本把它们当作通配符，规则的含义会变，因此拒绝导入。请在导出它的版本里把这条规则中的 { 和 } 改写成 %7B 和 %7D，重新导出后再导入。',
   snapshot_inconsistent: '快照里的记录互相对不上（例如授权指向快照里没有的安装实例），无法导入。',
   import_incomplete: '收到的记录数与快照末尾的计数不一致，可能漏传了一部分，导入没有完成。请重新签发令牌后再导入一次。',
   import_superseded: '这次导入已失效：实例已经初始化，或者有人用新令牌重新开始了导入。',
-  version_conflict: '此凭据已被更新，请刷新后重新轮换。',
+  version_conflict: '凭据在这期间被更新了（在别处保存过，或服务端轮换了 refresh token），请刷新页面后重新操作。',
   insufficient_scope: '当前没有这项资源的使用权限。',
   existing_grant_conflict: '该资源已有字段范围不同的有效授权。请先在授权表单手工调整该授权，再批准或拒绝此申请。',
   use_path_prefix_not_glob: '路径请输入 /v1 这样的前缀，不使用星号。',
   invalid_rule:
-    '格式不正确：每行写「方法 路径」或只写路径，方法为 GET、POST 等或 *，路径以 / 开头，不含 ; 和控制字符，只能在末尾写 /* 表示含子路径，例如 DELETE /v1/items/*。',
+    '格式不正确：每行写「方法 路径」或只写路径，方法为 GET、POST 等或 *，路径以 / 开头，不含 ; 和控制字符。一段用 {名字}（每段最多一个，前后可带文字，如 {r}:setIamPolicy），任意多段用 **，末尾的 /* 表示含子路径；其他位置不能写 *、{ 或 }。例如 DELETE /v1/items/{id}、* /**/{r}:setIamPolicy。',
   too_many_rules: '超过 50 条上限，请合并为带 /* 的前缀规则。',
   invalid_host:
     '写法不正确：每行一个小写域名（如 artifacts.example.com）或 *.后缀（如 *.example.com，* 后至少两段），不带 https://、端口和路径，不能是 IP 或本地域名；中文等域名写成 xn-- 形式。',
   public_origin_required: '连接地址必须是管理员信任的公网域名。',
   origin_must_be_https: '连接地址必须是 https:// 开头的公网域名。',
+  origin_must_not_contain_path: '服务地址只填 origin（如 https://api.example.com），不带路径、查询串和用户名。',
+  endpoint_must_not_contain_query:
+    '地址不能带查询串、# 片段或用户名；要发给 token 端点或授权页的额外参数，写在「额外参数」或「授权参数」里。',
+  invalid_query:
+    '查询参数不符合要求：最多 100 个，名称不含空格和控制字符；也不能带会改写 HTTP 方法或请求头的参数（如 $httpMethod）。',
+  // Exchanging the credential for a token: on saving a connection, approving a setup or authorizing.
+  token_exchange_failed:
+    'token 端点拒绝了换 token 的请求，或回复里没有可用的 access token。请检查 token 端点地址、客户端认证、scope 和凭据字段。',
+  token_unavailable: 'token 端点暂时不可用（超时、连不上、服务端出错或限流），请稍后重试。',
+  invalid_key_credential:
+    '密钥字段解析不了，或和所选算法不配：私钥要是 PEM 或 JWK，加密私钥要先在凭据表单里用口令解开；HS 算法的密钥按所选的密钥编码填写。',
+  ttl_required: 'token 端点的回复里没有有效期（expires_in），请在连接上填写 token 有效期（秒）。',
+  authorization_expired:
+    '这次授权已失效：超过了 10 分钟、已经完成过，或不是从当前登录会话发起的。请回到 API 连接页重新点授权。',
+  no_refresh_token:
+    '上游没有发回 refresh token，什么都没有保存。请检查连接的授权参数和 scope：Google 要加授权参数 access_type=offline 和 prompt=consent，Microsoft 要在 scope 里加 offline_access，Atlassian 要 scope 加 offline_access、授权参数加 prompt=consent，Dropbox 要加授权参数 token_access_type=offline。',
+  authorization_not_configured: '只有填了授权地址的 refresh token 连接才能在控制台授权。',
+  client_id_required: '授权请求要带客户端 ID：请在连接的客户端认证里填写客户端 ID，或选择存放它的凭据字段。',
+  unsupported_key_encryption: '这个私钥的加密方式浏览器解不开，请先用 openssl 转换。',
+  key_decryption_failed: '口令不对，或文件已损坏。',
+  connection_not_found: '找不到这条连接，可能已被删除，请刷新后重试。',
+  invalid_json: '提交的内容不是合法的 JSON，请刷新页面后重试。',
+  json_required: '提交的内容格式不对，请刷新页面后重试。',
   invalid_path:
     '路径前缀格式不正确，应形如 /v1：不含空格、查询串、; 和控制字符，也不含空段、. 或 .. 段（百分号编码后同样不行；段内的 %2F、%20 可以）。',
   invalid_input: '填写的内容不符合要求，请检查各字段后重试。',
@@ -231,6 +261,8 @@ const errorText: Record<string, string> = {
 
 export class Fault extends Error {
   code: string;
+  /** What a token endpoint said when it refused, which the page that acted keeps in view (EndpointRefusal). */
+  endpoint?: TokenEndpoint;
   constructor(code: string, text: string) {
     super(text);
     this.code = code;
@@ -264,6 +296,26 @@ export const send = (input: RequestInfo | URL, init?: RequestInit) =>
     throw fault('network_error');
   });
 
+/** Runs each load it is given but applies its answer only when no load started after it has applied its
+ * own: a poll that started before an action's own refresh, or before a sign-out, and arrives after it
+ * must not bring back what that changed. Each call resolves with what it loaded either way. */
+export function inOrder<T>(apply: (value: T) => void) {
+  let started = 0;
+  let applied = 0;
+  return async (load: () => Promise<T>) => {
+    const call = ++started;
+    const value = await load();
+    if (call > applied) {
+      applied = call;
+      apply(value);
+    }
+    return value;
+  };
+}
+/** Whether the page the server now serves at / no longer loads script, the entry script this page runs:
+ * a deployment since replaced it. */
+export const replaced = (html: string, script: string) => !html.includes(`src="${script}"`);
+
 export async function api(path: string, method = 'GET', body?: unknown, headers: Record<string, string> = {}) {
   const r = await send(path, {
     method,
@@ -281,13 +333,57 @@ export async function api(path: string, method = 'GET', body?: unknown, headers:
       e.message = `「${ruleKindText[at[1]]}」规则${at[2] ? `第 ${at[2]} 条` : ''}${e.message}`;
     const host = String(value.hint ?? '').match(/^hosts line (\d+)$/);
     if (host && e.code === 'invalid_host') e.message = `「额外域名」第 ${host[1]} 条${e.message}`;
+    // An endpoint of the connection's auth is checked like its origin; say which of the two is wrong.
+    const endpoint = String(value.hint ?? '').match(/^auth\.(tokenUrl|authorize\.url)\b/);
+    if (endpoint) e.message = `「${endpoint[1] === 'tokenUrl' ? 'token 端点' : '授权地址'}」${e.message}`;
+    // A refused form names its members by path (auth.jwt.claims), which says where to look.
+    if (e.code === 'invalid_input' && value.hint)
+      e.message += `（有问题的项：${[...String(value.hint).matchAll(/(?:^|; )([^:;]+):/g)].map((m) => m[1]).join('、')}）`;
+    if (e.code === 'invalid_key_credential') e.message = keyText(value.hint) ?? e.message;
+    if (value.token_endpoint) e.endpoint = value.token_endpoint as TokenEndpoint;
     // Which record of a refused snapshot is wrong, as the service names it.
-    if (value.hint && ['invalid_snapshot', 'snapshot_inconsistent', 'import_incomplete'].includes(e.code))
+    if (
+      value.hint &&
+      ['invalid_snapshot', 'snapshot_inconsistent', 'import_incomplete', 'backup_has_unconvertible_rule'].includes(
+        e.code,
+      )
+    )
       e.message += `（${String(value.hint)}）`;
     throw e;
   }
   return value;
 }
+// Why a key cannot be read, one text for each reason invalid() in packages/core/jwt.ts gives.
+const keyReasonText: [RegExp, (part: string) => string][] = [
+  [/^is not valid (\w+)$/, (encoding) => `按所选的密钥编码 ${encoding} 解不开`],
+  [/^is empty$/, () => '解码后是空的'],
+  [/^is neither a PEM private key nor a JSON Web Key$/, () => '既不是 PEM 私钥，也不是 JWK'],
+  [/^is encrypted: /, () => '带口令加密，服务用不了：请在凭据表单里载入它，用口令解开后再保存'],
+  [
+    /^is a PEM whose body is not base64$/,
+    () =>
+      '是 PEM，但正文不是 base64。从 JSON 文件里复制出来的私钥，换行常常是字面的 \\n：请用「从 JSON 文件填入」，或把它重新粘贴到字段里，控制台会换回换行。复制时只选引号里的内容（连同引号也可以），后面的逗号或空格不会被去掉',
+  ],
+  [/^is an EC PRIVATE KEY that names no curve$/, () => '是 EC PRIVATE KEY，但没有写明曲线'],
+  [
+    /^is a PEM "(.+)", which is not a format this service reads$/,
+    (label) => `是 PEM「${label}」，本服务读不了这种格式`,
+  ],
+  [/^starts with "\{" but is not JSON$/, () => '以 { 开头，但不是 JSON'],
+  [/^is not a private key for (\w+)$/, (alg) => `不是 ${alg} 能用的私钥，密钥类型和所选算法不配`],
+];
+/** What an invalid_key_credential hint says, in Chinese: the field and the reason. Undefined for a hint
+ * of another shape, which leaves the generic text. */
+export function keyText(hint: unknown) {
+  const [, field, reason] = String(hint ?? '').match(/^The key in field "([^"]+)" (.+)\.$/) ?? [];
+  for (const [pattern, text] of keyReasonText) {
+    const m = reason?.match(pattern);
+    if (m) return `字段「${field}」里的密钥${text(m[1])}。`;
+  }
+}
+/** A connection an approved setup created whose credential then failed its try, as the page says it. */
+export const warningText = (w: Warning) =>
+  (w.error === 'invalid_key_credential' && keyText(w.hint)) || fault(w.error).message;
 export const ruleKindText: Record<string, string> = { deny: '拒绝', approval: '必须单次审批', free: '免审批' };
 /** Said wherever extra hosts come to be listed: on the connection form, and on a draft that brings some. */
 export const hostedSuffixText =
@@ -328,7 +424,14 @@ export const parseRequested = (p: Pending) =>
   JSON.parse(p.requested_json) as
     | { grants: RequestedGrant[]; invocation?: never; setup?: never; update?: never }
     | { invocation: Invocation; grants?: never; setup?: never; update?: never }
-    | { setup: Setup; grants?: never; invocation?: never; update?: never }
+    | {
+        setup: Setup;
+        // Fixed on submission: the credential's id and each connection's, in the order of connections.
+        ids: { secretId?: string; connectionIds: string[] };
+        grants?: never;
+        invocation?: never;
+        update?: never;
+      }
     | { update: Update; current: string[]; updatedAt: number; grants?: never; invocation?: never; setup?: never };
 export const clientName = (s: Status, id: string) => s.clients.find((c) => c.clientId === id)?.name ?? id;
 export const resourceName = (s: Status, id: string) =>
@@ -341,7 +444,14 @@ export const authTypeText: Record<string, string> = {
   header: '自定义请求头',
   basic: '用户名与密码',
   query: 'URL 参数',
+  jwt: '签名 JWT',
+  'oauth-client': 'OAuth 客户端凭据换 token',
+  'oauth-jwt': 'JWT 断言换 token',
+  'oauth-refresh': 'Refresh Token 换 token',
 };
+/** A connection the Owner authorizes in the console whose credential holds no refresh token yet. */
+export const awaitingAuthorization = (auth: ConnectionAuth, secrets: Secret[]) =>
+  authorizes(auth) && !secrets.find((s) => s.id === auth.secretId)?.fields.includes(auth.refreshField);
 export const timeText = (value: number | null | undefined) =>
   value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—';
 export function relativeText(value: number) {

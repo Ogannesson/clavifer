@@ -3,8 +3,20 @@ import { Buffer } from 'node:buffer';
 import { assert, Fault } from '../../../packages/core/errors';
 import { decryptSecret } from '../../../packages/core/crypto';
 import {
+  assertFields,
+  authField,
+  authFields,
+  claim,
+  exchanges,
+  ref,
+  type DraftAuth,
+  type Present,
+} from '../../../packages/core/auth';
+import { JWT_ALGS, KEY_ENCODINGS, signJwt } from '../../../packages/core/jwt';
+import {
   canonicalPath,
   checkPath,
+  endpointUrl,
   targetUrl,
   upstreamHeaders,
   credentialHeaderName,
@@ -17,20 +29,111 @@ import {
   QUERY_TOO_LARGE,
 } from '../../../packages/core/proxy';
 import { type Bindings, type Principal, now, id, rootKeys, audit, boundedBytes } from './context';
+import { TIME_LIMIT, derivedToken, dropToken } from './token';
 
 // Messages on these schemas reach an Agent as the hint of invalid_arguments, naming what to fix.
 export const resourceId = z
   .string()
   .regex(/^[a-zA-Z0-9_-]{1,100}$/, 'an id is 1-100 letters, digits, "_" or "-"; copy it from credentials.list');
-export const valuesSchema = z
-  .record(z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$/), z.string().min(1).max(16384))
-  .refine((v) => Object.keys(v).length > 0 && Object.keys(v).length <= 20);
+const valueRecord = z.record(z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$/), z.string().min(1).max(16384));
+export const valuesSchema = valueRecord.refine((v) => Object.keys(v).length > 0 && Object.keys(v).length <= 20);
+// The values an approved setup takes may be none, when every field it declares is a refresh token
+// that authorizing writes (setupStatements in index.ts decides which may be left out).
+export const setupValues = valueRecord.refine((v) => Object.keys(v).length <= 20);
 export const secretInput = z.object({
   name: z.string().trim().min(1).max(120),
   description: z.string().max(1000).default(''),
   values: valuesSchema,
 });
-const authField = z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$/);
+// What signing a JWT takes; jwt.ts sets alg, iat, exp and (with jti) jti, so none of them is written here.
+const jwtInput = z
+  .strictObject({
+    alg: z.enum(JWT_ALGS),
+    keyField: authField,
+    keyEncoding: z.enum(KEY_ENCODINGS).optional(),
+    header: z
+      .record(z.string().min(1).max(64), z.union([z.string().max(4096), ref]))
+      .refine((h) => !Object.hasOwn(h, 'alg'), { message: 'alg is set from jwt.alg, not written in header' })
+      .optional(),
+    claims: z
+      .record(z.string().min(1).max(256), claim)
+      .refine((c) => !['iat', 'exp', 'jti'].some((name) => Object.hasOwn(c, name)), {
+        message: 'iat and exp are set from lifetime and jti by jti: true, so claims cannot hold them',
+      }),
+    lifetime: z.int().min(10).max(3600),
+    jti: z.boolean().optional(),
+  })
+  .refine((j) => j.alg.startsWith('HS') === (j.keyEncoding !== undefined), {
+    message: 'keyEncoding is required for HS256, HS384 and HS512 and not allowed with any other alg',
+    path: ['keyEncoding'],
+  });
+const clientId = z.union([z.string().min(1).max(1024), ref]);
+const secretClient = <M extends 'basic' | 'post'>(method: M) =>
+  z.strictObject({ method: z.literal(method), id: clientId, secretField: authField });
+const jwtClient = z.strictObject({ method: z.literal('jwt'), id: clientId.optional(), jwt: jwtInput });
+const publicClient = z.strictObject({ method: z.literal('none'), id: clientId.optional() });
+// Extra parameters of a request; the names the service writes itself are not among them, in any case,
+// since a server may read a name regardless of case. A value is sent as it is written, so whitespace
+// around it, which the console trims, is refused rather than sent.
+const extraParams = (reserved: string[]) =>
+  z
+    .record(
+      z.string().regex(/^[A-Za-z0-9_.:~-]{1,128}$/),
+      z
+        .string()
+        .max(4096)
+        .refine((v) => v === v.trim(), { message: 'a value cannot start or end with whitespace' }),
+    )
+    .refine((p) => Object.keys(p).length <= 20, { message: 'at most 20 parameters' })
+    .refine((p) => !Object.keys(p).some((name) => reserved.includes(name.toLowerCase())), {
+      message: `the service sets ${reserved.join(', ')} itself`,
+    });
+// Where the token goes: Authorization with "Bearer" unless named otherwise; scheme "" sends the token alone.
+const present = {
+  header: z
+    .string()
+    .refine(credentialHeaderName, { message: 'a header name the caller cannot send itself' })
+    .optional(),
+  scheme: z
+    .string()
+    .regex(/^[A-Za-z0-9!#$%&'*+.^_`|~-]{0,64}$/)
+    .optional(),
+};
+const scope = z.string().min(1).max(4096);
+// The token endpoint, checked like an origin with endpointUrl when a connection is saved or proposed.
+const exchange = {
+  ...present,
+  tokenUrl: z.string().url().max(2048),
+  bodyFormat: z.enum(['form', 'json']).optional(),
+  params: extraParams([
+    'grant_type',
+    'scope',
+    'client_id',
+    'client_secret',
+    'client_assertion',
+    'client_assertion_type',
+    'assertion',
+    'refresh_token',
+    'code',
+    'redirect_uri',
+    'code_verifier',
+  ]).optional(),
+  // For a token endpoint whose response has no expires_in.
+  ttl: z.int().min(1).max(31536000).optional(),
+};
+const authorizeInput = z.strictObject({
+  url: z.string().url().max(2048),
+  scope: scope.optional(),
+  params: extraParams([
+    'response_type',
+    'client_id',
+    'redirect_uri',
+    'state',
+    'code_challenge',
+    'code_challenge_method',
+    'scope',
+  ]).optional(),
+});
 export const authInput = z.discriminatedUnion('type', [
   z.object({ type: z.literal('none') }),
   z.object({ type: z.literal('bearer'), secretId: resourceId, field: authField }),
@@ -47,6 +150,38 @@ export const authInput = z.discriminatedUnion('type', [
     field: authField,
     name: z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_.~-]{0,63}$/),
   }),
+  // A JWT signed for every request.
+  z.object({ type: z.literal('jwt'), secretId: resourceId, jwt: jwtInput, ...present }),
+  // The token endpoint's own grant, client_credentials unless named (Zoom's account_credentials).
+  z.object({
+    type: z.literal('oauth-client'),
+    secretId: resourceId,
+    client: z.discriminatedUnion('method', [secretClient('basic'), secretClient('post'), jwtClient]),
+    grantType: z
+      .string()
+      .regex(/^[\x21-\x7e]{1,256}$/)
+      .optional(),
+    scope: scope.optional(),
+    ...exchange,
+  }),
+  // A JWT bearer assertion (RFC 7523 §2.1), with a client authentication if the endpoint wants one.
+  z.object({
+    type: z.literal('oauth-jwt'),
+    secretId: resourceId,
+    jwt: jwtInput,
+    client: z.discriminatedUnion('method', [secretClient('basic'), secretClient('post')]).optional(),
+    ...exchange,
+  }),
+  // A refresh token kept in refreshField; authorize is where the Owner signs in to obtain one.
+  z.object({
+    type: z.literal('oauth-refresh'),
+    secretId: resourceId,
+    refreshField: authField,
+    client: z.discriminatedUnion('method', [secretClient('basic'), secretClient('post'), jwtClient, publicClient]),
+    scope: scope.optional(),
+    authorize: authorizeInput.optional(),
+    ...exchange,
+  }),
 ]);
 // A setup creates its credential, so its auth names fields of that credential and never a secretId:
 // binding a stored secret would let an Agent send it to an origin of its choosing.
@@ -56,17 +191,32 @@ const draftAuth = z.discriminatedUnion('type', [
   z.strictObject(authInput.options[2].omit({ secretId: true }).shape),
   z.strictObject(authInput.options[3].omit({ secretId: true }).shape),
   z.strictObject(authInput.options[4].omit({ secretId: true }).shape),
+  z.strictObject(authInput.options[5].omit({ secretId: true }).shape),
+  z.strictObject(authInput.options[6].omit({ secretId: true }).shape),
+  z.strictObject(authInput.options[7].omit({ secretId: true }).shape),
+  z.strictObject(authInput.options[8].omit({ secretId: true }).shape),
 ]);
-export function authFields(auth: z.infer<typeof draftAuth>): string[] {
-  return auth.type === 'none' ? [] : auth.type === 'basic' ? [auth.usernameField, auth.passwordField] : [auth.field];
+/** The auth with its token and authorization endpoints checked as endpointUrl checks them and written
+ * as URL writes them; a failure names the member. */
+export function authEndpoints<T extends DraftAuth>(auth: T, allowLocal: boolean): T {
+  const checked = (at: string, url: string) => {
+    try {
+      return endpointUrl(url, allowLocal);
+    } catch (e) {
+      const { code, status, message } = e as Fault;
+      throw new Fault(code, status, `auth.${at}${message === code ? '' : `: ${message}`}`);
+    }
+  };
+  if (!('tokenUrl' in auth)) return auth;
+  const authorize = 'authorize' in auth ? auth.authorize : undefined;
+  return {
+    ...auth,
+    tokenUrl: checked('tokenUrl', auth.tokenUrl),
+    ...(authorize && { authorize: { ...authorize, url: checked('authorize.url', authorize.url) } }),
+  };
 }
 export function validateAuthBinding(auth: z.infer<typeof authInput>, values: Record<string, string>) {
-  for (const field of authFields(auth))
-    assert(
-      Object.hasOwn(values, field) && typeof values[field] === 'string' && values[field].length > 0,
-      'secret_field_not_found',
-      404,
-    );
+  assertFields(auth, values);
   if (auth.type === 'basic') {
     assert(
       !/[:\x00-\x1f\x7f]/.test(values[auth.usernameField]) && !/[\x00-\x1f\x7f]/.test(values[auth.passwordField]),
@@ -186,6 +336,13 @@ export function requestedExtension(
 export const liveExtensions = (value: string | null | undefined) =>
   value ? (JSON.parse(value) as Extension[]).filter((e) => e.expiresAt === null || e.expiresAt > now()) : [];
 export const readInput = z.object({ fields: z.array(authField).min(1).max(20).optional() });
+// What the console's callback page sends back from an authorization of connection: the state the start
+// put in the authorization URL and the code the upstream added to the callback.
+export const completeInput = z.object({
+  connection: resourceId,
+  state: z.string().min(1).max(256),
+  code: z.string().min(1).max(4096),
+});
 const requestHeaders = z
   .record(z.string().min(1).max(256), z.string().max(8192))
   .refine((v) => Object.keys(v).length <= 100, { message: 'at most 100 headers' });
@@ -232,12 +389,13 @@ export function decide(
   grant: Extension[] | null,
 ): Decision {
   const path = canonicalPath(rawPath);
-  const denied = policy.deny?.find((rule) => matchRule([rule], method, path));
+  // A deny or approval rule matches the path decoded or as sent; a free rule with wildcards only both (see matchRule).
+  const denied = policy.deny?.find((rule) => matchRule([rule], method, path, rawPath));
   if (denied) return { code: 'path_denied', rule: denied };
-  if (matchRule(policy.approval, method, path)) return { code: 'approval_required' };
+  if (matchRule(policy.approval, method, path, rawPath)) return { code: 'approval_required' };
   const inPaths = checkPath(rawPath, policy.paths);
   const inScope = inPaths && (policy.methods ?? ['GET', 'HEAD']).includes(method);
-  if (inScope && matchRule(policy.free, method, path)) return { code: 'run' };
+  if (inScope && matchRule(policy.free, method, path, rawPath, true)) return { code: 'run' };
   if (grant && (inScope || grant.some((e) => checkPath(rawPath, e.paths) && e.methods.includes(method))))
     return { code: 'run' };
   return { code: !inPaths ? 'path_not_allowed' : !inScope ? 'method_not_allowed' : 'grant_required' };
@@ -543,26 +701,34 @@ export async function accessRequest(env: Bindings, p: Principal, input: unknown,
     );
   }
   const { setup, update } = body.requested;
-  const stored: StoredRequest = setup
+  const draft = setup
     ? await setupRequest(env, p.userId, setup)
     : update
       ? await updateRequest(env, p.userId, update)
-      : body.requested;
-  const requested = JSON.stringify(stored);
+      : undefined;
   // They are fixed on submission, so access.status can name them once the Owner approves.
   const ids = setup && {
     ...(setup.secret ? { secretId: id() } : {}),
     connectionIds: setup.connections.map(() => id()),
   };
-  const value = ids ? JSON.stringify({ ...stored, ids }) : requested;
   // Counted as stored, after JSON escaping, which is what the database, the console and every snapshot hold.
-  const size = new TextEncoder().encode(value + body.reason).byteLength;
-  assert(
-    size <= 256 * 1024,
-    'request_too_large',
-    413,
-    `This request takes ${size} bytes as stored and at most 262144 (256 KiB) are accepted. The size counted is the stored JSON, where escaping can grow text several times (64 KiB of control characters takes about 393 KB). Split the draft into smaller requests or trim its tests, descriptions and body.`,
-  );
+  const measure = (stored: StoredRequest) => {
+    const value = JSON.stringify(ids ? { ...stored, ids } : stored);
+    const size = new TextEncoder().encode(value + body.reason).byteLength;
+    assert(
+      size <= 256 * 1024,
+      'request_too_large',
+      413,
+      `This request takes ${size} bytes as stored and at most 262144 (256 KiB) are accepted. The size counted is the stored JSON, where escaping can grow text several times (64 KiB of control characters takes about 393 KB). Split the draft into smaller requests or trim its tests, descriptions and body.`,
+    );
+    return { value, size };
+  };
+  // A draft is measured before its tests run, so an oversized one costs no test run, and again with
+  // what the tests add to it (an update's verdicts on the current policy).
+  let stored: StoredRequest = draft?.stored ?? body.requested;
+  let { value, size } = measure(stored);
+  if (draft) ({ value, size } = measure((stored = draft.test())));
+  const requested = JSON.stringify(stored);
   // The ids of what a setup creates differ on every submission, so a resubmission is matched without them.
   const old = await env.DB.prepare(
     "SELECT id FROM access_requests WHERE client_id=? AND status='pending' AND expires_at>? AND json_remove(requested_json,'$.ids')=json(?) LIMIT 1",
@@ -620,50 +786,68 @@ async function assertConnectionNameFree(env: Bindings, owner: string, name: stri
     `A connection named "${name}" exists or existed. Choose another name and submit again.`,
   );
 }
-/** Checks each connection of a setup as the Owner's form would and runs its tests on its draft policy;
- * an error names the connection by index and name. The stored draft has the origins and rules as
- * approval will save them, so the Owner reviews exactly that. */
-async function setupRequest(env: Bindings, owner: string, setup: z.infer<typeof setupInput>) {
-  const failed: string[] = [];
+/** A draft as it will be stored, and test, which runs its tests and returns it with what they add. */
+type Draft = { stored: StoredRequest; test: () => StoredRequest };
+/** Checks each connection of a setup as the Owner's form would; its test runs the tests of each
+ * connection on its draft policy. An error names the connection by index and name. The stored draft
+ * has the origins and rules as approval will save them, so the Owner reviews exactly that. */
+async function setupRequest(env: Bindings, owner: string, setup: z.infer<typeof setupInput>): Promise<Draft> {
+  const tested: [Required<ConnectionPolicy>, PolicyTest[], string][] = [];
   const connections = [];
   for (const [i, c] of setup.connections.entries()) {
     const at = `connections.${i} "${c.name}"`;
-    let origin, policy;
+    let origin, policy, auth;
     try {
       ({ origin } = targetUrl(c.origin, '/', env.ALLOW_LOCAL_HTTP === 'true'));
       policy = JSON.parse(policyJson(c, env.ALLOW_LOCAL_HTTP === 'true')) as Required<ConnectionPolicy>;
+      auth = authEndpoints(c.auth, env.ALLOW_LOCAL_HTTP === 'true');
     } catch (e) {
       const { code, status, message } = e as Fault;
       throw new Fault(code, status, `${at}: ${message}`);
     }
     await assertConnectionNameFree(env, owner, c.name);
-    failed.push(...mismatches(policy, c.tests, `${at} tests`));
+    tested.push([policy, c.tests, `${at} tests`]);
     const { deny, approval, free } = policy;
-    connections.push({ ...c, origin, deny, approval, free });
+    connections.push({ ...c, origin, auth, deny, approval, free });
   }
-  assertTests(
-    failed,
-    setup.connections.reduce((n, c) => n + c.tests.length, 0),
-  );
-  return { setup: { ...setup, connections } };
+  const stored = { setup: { ...setup, connections } };
+  return {
+    stored,
+    test: () => {
+      assertTests(
+        tested.flatMap(([policy, tests, at]) => mismatches(policy, tests, at)),
+        setup.connections.reduce((n, c) => n + c.tests.length, 0),
+      );
+      return stored;
+    },
+  };
 }
-/** Checks an update applied to its connection as the Owner's form would, and runs its tests on the
- * proposed policy and, for the Owner's comparison, on the current one. */
-async function updateRequest(env: Bindings, owner: string, update: z.infer<typeof updateInput>) {
+/** Checks an update applied to its connection as the Owner's form would; its test runs the tests on
+ * the proposed policy and, for the Owner's comparison, on the current one. */
+async function updateRequest(env: Bindings, owner: string, update: z.infer<typeof updateInput>): Promise<Draft> {
   const { conn, policy: current } = await activeConnection(env, owner, update.connection);
   const merged = withChanges(conn, update.changes);
   const policy = JSON.parse(policyJson(merged, env.ALLOW_LOCAL_HTTP === 'true')) as Required<ConnectionPolicy>;
   if (merged.name !== conn.name) await assertConnectionNameFree(env, owner, merged.name);
-  assertTests(mismatches(policy, update.tests), update.tests.length);
   // Changed rules are stored normalized, so the Owner compares them with the saved ones line by line.
   const proposed: Record<string, unknown> = { name: merged.name, description: merged.description, ...policy };
-  return {
+  const stored = {
     update: {
       ...update,
       changes: Object.fromEntries(Object.keys(update.changes).map((k) => [k, proposed[k]])) as typeof update.changes,
     },
-    current: verdicts(current, update.tests).map((d) => d.code),
     updatedAt: conn.updated_at,
+  };
+  return {
+    stored,
+    test: () => {
+      assertTests(mismatches(policy, update.tests), update.tests.length);
+      return {
+        update: stored.update,
+        current: verdicts(current, update.tests).map((d) => d.code),
+        updatedAt: stored.updatedAt,
+      };
+    },
   };
 }
 export async function accessStatus(env: Bindings, p: Principal, rid: string) {
@@ -816,10 +1000,15 @@ async function requestFingerprint(
     ),
   );
 }
+const liveApproval =
+  "SELECT id FROM access_requests WHERE owner_id=? AND client_id=? AND fingerprint=? AND status='approved' AND consumed_at IS NULL AND expires_at>? LIMIT 1";
+/** Whether a live approval of this exact request exists, without consuming it. */
+const hasApproval = async (env: Bindings, p: Principal, fingerprint: string) =>
+  !!(await env.DB.prepare(liveApproval).bind(p.userId, p.clientId, fingerprint, now()).first());
 /** Atomically consumes one live approval of this exact request, returning its request id. */
 async function consumeApproval(env: Bindings, p: Principal, fingerprint: string) {
   const row = await env.DB.prepare(
-    "UPDATE access_requests SET consumed_at=? WHERE id=(SELECT id FROM access_requests WHERE owner_id=? AND client_id=? AND fingerprint=? AND status='approved' AND consumed_at IS NULL AND expires_at>? LIMIT 1) AND consumed_at IS NULL RETURNING id",
+    `UPDATE access_requests SET consumed_at=? WHERE id=(${liveApproval}) AND consumed_at IS NULL RETURNING id`,
   )
     .bind(now(), p.userId, p.clientId, fingerprint, now())
     .first<{ id: string }>();
@@ -851,6 +1040,39 @@ const bodyTooLarge = () =>
     413,
     'A request body is limited to 1 MiB. Split the work into smaller requests; upload large files with the host’s own tools.',
   );
+/** The value of header for a token: "Bearer <token>" unless the connection names another scheme or none. */
+const presented = (auth: Present, token: string) =>
+  [auth.header ?? 'authorization', auth.scheme === '' ? token : `${auth.scheme ?? 'Bearer'} ${token}`] as const;
+/** Adds the connection's credential to the request, returning the cached token it used, if any. */
+async function addCredential(env: Bindings, p: Principal, auth: z.infer<typeof authInput>, url: URL, headers: Headers) {
+  if (auth.type === 'none') return;
+  if (exchanges(auth)) {
+    const issued = await derivedToken({ env, owner: p.userId, actor: p.clientId, deadline: now() + TIME_LIMIT }, auth);
+    headers.set(...presented(auth, issued.value));
+    return issued;
+  }
+  const values = (await boundSecret(env, p.userId, auth.secretId)).values;
+  validateAuthBinding(auth, values);
+  if (auth.type === 'jwt') headers.set(...presented(auth, await signJwt(auth.jwt, values)));
+  else if (auth.type === 'basic') {
+    const encoded = Buffer.from(`${values[auth.usernameField]}:${values[auth.passwordField]}`, 'utf8').toString(
+      'base64',
+    );
+    headers.set('authorization', `Basic ${encoded}`);
+  } else if (auth.type === 'query') {
+    // A caller must not shadow an injected key through duplicate or
+    // case-insensitive upstream query parsing.
+    for (const name of [...url.searchParams.keys()])
+      if (name.toLowerCase() === auth.name.toLowerCase()) url.searchParams.delete(name);
+    url.searchParams.set(auth.name, values[auth.field]);
+    assert(url.href.length <= 32768, 'query_too_large', 413, QUERY_TOO_LARGE);
+  } else {
+    headers.set(
+      auth.type === 'bearer' ? 'authorization' : auth.name,
+      auth.type === 'bearer' ? `Bearer ${values[auth.field]}` : values[auth.field],
+    );
+  }
+}
 export async function invoke(env: Bindings, p: Principal, input: InvokeRequest) {
   const requestBody =
     input.body === undefined
@@ -873,46 +1095,30 @@ export async function invoke(env: Bindings, p: Principal, input: InvokeRequest) 
   const query = Array.isArray(input.query) ? input.query : Object.entries(input.query ?? {});
   appendQuery(url, query);
   const headers = upstreamHeaders(input.headers ?? {});
-  // A matching one-time approval runs any request the policy refuses but does not deny.
-  if (decision.code !== 'run') {
-    const approval = await consumeApproval(
-      env,
-      p,
-      await requestFingerprint(
-        input.connection,
-        input.method,
-        input.path,
-        query,
-        headers,
-        requestBody ?? new Uint8Array(),
-        origin,
-      ),
-    );
+  // A matching one-time approval runs any request the policy refuses but does not deny. It is looked up
+  // first, so a request without one exchanges no token, and consumed only once the credential is ready,
+  // so a failed exchange leaves it for the request sent again.
+  const fingerprint =
+    decision.code === 'run'
+      ? undefined
+      : await requestFingerprint(
+          input.connection,
+          input.method,
+          input.path,
+          query,
+          headers,
+          requestBody ?? new Uint8Array(),
+          origin,
+        );
+  if (fingerprint && !(await hasApproval(env, p, fingerprint))) throw refusal(decision, !!origin);
+  const auth = authInput.parse(JSON.parse(conn.auth_json));
+  // Getting a token has a time limit of its own, so a slow one never leaves the upstream call short
+  // of time after the approval was spent.
+  const issued = await addCredential(env, p, auth, url, headers);
+  if (fingerprint) {
+    const approval = await consumeApproval(env, p, fingerprint);
     if (!approval) throw refusal(decision, !!origin);
     await audit(env, p.clientId, 'access:consume', approval);
-  }
-  const auth = authInput.parse(JSON.parse(conn.auth_json));
-  if (auth.type !== 'none') {
-    const values = (await boundSecret(env, p.userId, auth.secretId)).values;
-    validateAuthBinding(auth, values);
-    if (auth.type === 'basic') {
-      const encoded = Buffer.from(`${values[auth.usernameField]}:${values[auth.passwordField]}`, 'utf8').toString(
-        'base64',
-      );
-      headers.set('authorization', `Basic ${encoded}`);
-    } else if (auth.type === 'query') {
-      // A caller must not shadow an injected key through duplicate or
-      // case-insensitive upstream query parsing.
-      for (const name of [...url.searchParams.keys()])
-        if (name.toLowerCase() === auth.name.toLowerCase()) url.searchParams.delete(name);
-      url.searchParams.set(auth.name, values[auth.field]);
-      assert(url.href.length <= 32768, 'query_too_large', 413, QUERY_TOO_LARGE);
-    } else {
-      headers.set(
-        auth.type === 'bearer' ? 'authorization' : auth.name,
-        auth.type === 'bearer' ? `Bearer ${values[auth.field]}` : values[auth.field],
-      );
-    }
   }
   await audit(env, p.clientId, 'connection:invoke', input.connection, 'started');
   let response: Response;
@@ -943,6 +1149,9 @@ export async function invoke(env: Bindings, p: Principal, input: InvokeRequest) 
     if (value) safeHeaders.set(key, value);
   }
   safeHeaders.set('cache-control', 'no-store');
+  // A cached token the upstream no longer takes is dropped, not retried; one minted within the last
+  // minute is kept, since some upstreams answer 401 for a request the token may not make.
+  if (response.status === 401 && issued && now() - issued.createdAt >= 60000) await dropToken(env, issued);
   await audit(env, p.clientId, 'connection:invoke', input.connection, `http_${response.status}`);
   return { status: response.status, headers: Object.fromEntries(safeHeaders), body: response.body };
 }

@@ -111,7 +111,7 @@ Verify:
 "<CLAVIFER>" version
 ```
 
-It prints `clavifer 0.5.0`. The number is the version of the client that was built; this release is 0.5.0.
+It prints `clavifer 0.6.0`. The number is the version of the client that was built; this release is 0.6.0.
 
 Rerun: Safe.
 

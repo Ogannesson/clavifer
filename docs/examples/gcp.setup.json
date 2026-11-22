@@ -1,0 +1,1141 @@
+{
+  "secret": {
+    "name": "GCP service account",
+    "description": "A GCP service account key; fields as in its JSON key file. Regular scopes only read (GET, HEAD); a write needs a one-time approval or a scope extension, and deny and approval rules still apply during one. Denied: what hands the agent a credential (keys, signed URLs, certificates, batch, $rpc). Approval: changing permissions, running code as a service account or sending its token out. Not ruled, as get and list return them too: Run and Functions env, Composer envVariables, Workflows sourceContents, Build step env, Scheduler and Tasks headers and bodies, Compute metadata, Batch container passwords; keep secrets in Secret Manager and reference them. No connection for iamcredentials or sts (they mint credentials); no hosts list *.googleapis.com. container, firebase, pubsub, kms, identitytoolkit, bigquery, aiplatform, artifactregistry, spanner and cloudasset have none: each reaches a credential or code (container clientKey, pubsub push oidcToken, kms :decrypt); rule them like these first.",
+    "fields": ["client_email", "private_key", "private_key_id"]
+  },
+  "connections": [
+    {
+      "name": "GCP IAM",
+      "origin": "https://iam.googleapis.com",
+      "description": "Identity and Access Management API (iam.googleapis.com), v1 to v3, as the service account. Read-only regular scope. Denied: batch and $rpc endpoints, creating or uploading service account keys, signBlob and signJwt. One-time approval: setIamPolicy, creating and changing custom roles, writes to deny policies and to workload identity pools (v1 and v1beta; reading either runs), and any request on principal access boundary policies, policy bindings, access policies, workforce pools and OAuth clients.",
+      "paths": ["/v1", "/v2", "/v3"],
+      "methods": ["GET", "HEAD"],
+      "deny": [
+        "* /batch/*",
+        "* /$rpc/*",
+        "POST /v1/projects/{p}/serviceAccounts/{sa}/keys",
+        "* /v1/projects/{p}/serviceAccounts/{sa}/keys:upload",
+        "* /v1/projects/{p}/serviceAccounts/{sa}:signBlob",
+        "* /v1/projects/{p}/serviceAccounts/{sa}:signJwt"
+      ],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /v1/{scope}/{id}/roles",
+        "PATCH /v1/{scope}/{id}/roles/{role}",
+        "POST /v2/policies/*",
+        "PUT /v2/policies/*",
+        "PATCH /v2/policies/*",
+        "DELETE /v2/policies/*",
+        "* /v3/**/principalAccessBoundaryPolicies/*",
+        "* /v3/**/policyBindings/*",
+        "* /v3/**/accessPolicies/*",
+        "POST /{v}/projects/{p}/locations/{l}/workloadIdentityPools/*",
+        "PUT /{v}/projects/{p}/locations/{l}/workloadIdentityPools/*",
+        "PATCH /{v}/projects/{p}/locations/{l}/workloadIdentityPools/*",
+        "DELETE /{v}/projects/{p}/locations/{l}/workloadIdentityPools/*",
+        "* /v1/locations/{l}/workforcePools/*",
+        "* /v1/projects/{p}/locations/{l}/oauthClients/*"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com/keys", "expect": "path_denied" },
+        { "method": "POST", "path": "/v1/projects/-/serviceAccounts/sa%40p.iam.gserviceaccount.com/keys", "grant": true, "expect": "path_denied" },
+        { "method": "POST", "path": "/v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com/keys:upload", "expect": "path_denied" },
+        { "method": "POST", "path": "/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:signBlob", "expect": "path_denied" },
+        { "method": "POST", "path": "/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:signJwt", "expect": "path_denied" },
+        { "method": "GET", "path": "/v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com/keys", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.iam.admin.v1.IAM/CreateServiceAccountKey", "expect": "path_denied" },
+        { "method": "POST", "path": "/v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com%3AsetIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com:SETIAMPOLICY/", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/global/workloadIdentityPools/pool/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com:getIamPolicy", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/projects/p/roles", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/organizations/o/roles", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v1/projects/p/roles/r", "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/roles", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/v2/policies/cloudresourcemanager.googleapis.com%2Fprojects%2Fp/denypolicies", "expect": "approval_required" },
+        { "method": "GET", "path": "/v2/policies/cloudresourcemanager.googleapis.com%2Fprojects%2Fp/denypolicies", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v2/policies/cloudresourcemanager.googleapis.com%2Fprojects%2Fp/denypolicies/d", "grant": true, "expect": "run" },
+        { "method": "PUT", "path": "/v2/policies/cloudresourcemanager.googleapis.com%2Fprojects%2Fp/denypolicies/d", "expect": "approval_required" },
+        { "method": "DELETE", "path": "/v2/policies/cloudresourcemanager.googleapis.com%2Fprojects%2Fp/denypolicies/d", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v3/organizations/o/locations/global/principalAccessBoundaryPolicies", "expect": "approval_required" },
+        { "method": "POST", "path": "/v3/projects/p/locations/global/policyBindings", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v3/folders/f/locations/global/accessPolicies/a", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/global/workloadIdentityPools", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/global/workloadIdentityPools/pool/providers/prov/keys", "expect": "approval_required" },
+        { "method": "DELETE", "path": "/v1/projects/p/locations/global/workloadIdentityPools/pool/providers/prov", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v1beta/projects/p/locations/global/workloadIdentityPools/pool/providers", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v1beta/projects/p/locations/global/workloadIdentityPools/pool", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/locations/global/workloadIdentityPools/pool/providers", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/locations/global/workloadIdentityPools", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/v1/locations/global/workforcePools", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/global/oauthClients/c/credentials", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/serviceAccounts", "grant": true, "expect": "method_not_allowed" },
+        { "method": "DELETE", "path": "/v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com", "grant": true, "expect": "method_not_allowed" },
+        { "method": "GET", "path": "/v1/projects/p/serviceAccounts", "expect": "grant_required" },
+        { "method": "GET", "path": "/v1/projects/p/serviceAccounts", "grant": true, "expect": "run" },
+        { "method": "HEAD", "path": "/v1/projects/p/serviceAccounts", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/$discovery/rest", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Compute Engine",
+      "origin": "https://compute.googleapis.com",
+      "description": "Compute Engine API (compute.googleapis.com), /compute/v1, as the service account. Read-only regular scope. Denied: batch and $rpc endpoints. One-time approval (the rules cover v1, beta and alpha): setIamPolicy, project and instance metadata (ssh-keys, startup-script), an instance's service account, reading an instance's serial port output (serialPort), creating, replacing or bulk-inserting instances, creating instance templates, a zone's instanceSettings, creating and patching managed instance groups and their per-instance configs (each can carry a startup-script), and addSignedUrlKey.",
+      "paths": ["/compute/v1"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "* /compute/{v}/projects/{p}/setCommonInstanceMetadata",
+        "* /**/instances/{i}/setMetadata",
+        "* /**/instances/{i}/setServiceAccount",
+        "GET /compute/{v}/projects/{p}/zones/{z}/instances/{i}/serialPort",
+        "POST /compute/{v}/projects/{p}/zones/{z}/instances",
+        "PUT /compute/{v}/projects/{p}/zones/{z}/instances/{i}",
+        "POST /**/instances/bulkInsert",
+        "POST /compute/{v}/projects/{p}/global/instanceTemplates",
+        "POST /compute/{v}/projects/{p}/regions/{r}/instanceTemplates",
+        "PATCH /compute/{v}/projects/{p}/zones/{z}/instanceSettings",
+        "POST /**/instanceGroupManagers",
+        "PATCH /**/instanceGroupManagers/{m}",
+        "* /**/instanceGroupManagers/{m}/updatePerInstanceConfigs",
+        "* /**/instanceGroupManagers/{m}/patchPerInstanceConfigs",
+        "* /**/addSignedUrlKey"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/batch/compute/v1", "expect": "path_denied" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.compute.v1.Instances/SetMetadata", "expect": "path_denied" },
+        { "method": "POST", "path": "/compute/v1/projects/p/zones/z/instances/i/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/locations/global/firewallPolicies/f/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/beta/projects/p/regions/r/subnetworks/s/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/zones/z/instances/i:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/zones/z/instances/i/SETIAMPOLICY/", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/setCommonInstanceMetadata", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/alpha/projects/p/setCommonInstanceMetadata", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/zones/z/instances/i/setMetadata", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/zones/z/instances/i/setServiceAccount", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/zones/z/instances", "expect": "approval_required" },
+        { "method": "PUT", "path": "/compute/v1/projects/p/zones/z/instances/i", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/zones/z/instances/bulkInsert", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/regions/r/instances/bulkInsert", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/global/instanceTemplates", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/regions/r/instanceTemplates", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/compute/v1/projects/p/zones/z/instanceSettings", "expect": "approval_required" },
+        { "method": "GET", "path": "/compute/v1/projects/p/zones/z/instanceSettings", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/compute/v1/projects/p/zones/z/instanceGroupManagers", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/beta/projects/p/regions/r/instanceGroupManagers", "grant": true, "expect": "approval_required" },
+        { "method": "PATCH", "path": "/compute/v1/projects/p/regions/r/instanceGroupManagers/m", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/compute/v1/projects/p/zones/z/instanceGroupManagers/m", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/zones/z/instanceGroupManagers/m/updatePerInstanceConfigs", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/regions/r/instanceGroupManagers/m/patchPerInstanceConfigs", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/compute/v1/projects/p/zones/z/instanceGroupManagers", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/compute/v1/projects/p/regions/r/instanceGroupManagers/m", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/compute/v1/projects/p/zones/z/instanceGroupManagers/m/resize", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/compute/v1/projects/p/global/backendServices/s/addSignedUrlKey", "expect": "approval_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/global/backendBuckets/b/addSignedUrlKey", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/compute/v1/projects/p/global/backendServices/s", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/compute/v1/projects/p/zones/z/instances", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/compute/v1/projects/p/zones/z/instances/i", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/compute/v1/projects/p/zones/z/instances/i/getIamPolicy", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/compute/v1/projects/p/zones/z/instances/i/serialPort", "grant": true, "expect": "approval_required" },
+        { "method": "HEAD", "path": "/compute/beta/projects/p/zones/z/instances/i/serialPort", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/compute/v1/projects/p/zones/z/instances/i%2FserialPort", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/compute/v1/projects/p/zones/z/instances", "expect": "grant_required" },
+        { "method": "POST", "path": "/compute/v1/projects/p/zones/z/instances/i/stop", "grant": true, "expect": "method_not_allowed" },
+        { "method": "DELETE", "path": "/compute/v1/projects/p/zones/z/instances/i", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/compute/v1/projects/p/global/firewalls", "expect": "method_not_allowed" },
+        { "method": "GET", "path": "/compute/beta/projects/p/zones/z/instances", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Cloud Storage",
+      "origin": "https://storage.googleapis.com",
+      "description": "Cloud Storage JSON API (storage.googleapis.com), /storage/v1, as the service account. Read-only regular scope; the upload, download and XML API paths on the same host are outside it, so an extension with the path / opens all of them. Reading an object's content with alt=media is a read like reading its metadata. Denied: batch and $rpc endpoints, creating HMAC keys. One-time approval: bucket, object and managed folder IAM policies, ACLs and default object ACLs, and patching or replacing a bucket (its acl, iamConfiguration and the predefinedAcl parameter) or an object's metadata (its acl). Not ruled: creating, composing, copying and rewriting an object can also set its ACL, through acl in the body or the predefinedAcl and destinationPredefinedAcl parameters. These are the main ways to write an object, so an approval rule on them would make every upload under an extension wait for the Owner. Turn on uniform bucket-level access and public access prevention on each bucket: with them, object ACLs have no effect.",
+      "paths": ["/storage/v1"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*", "POST /storage/v1/projects/{p}/hmacKeys"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "PUT /storage/v1/b/**/iam",
+        "* /storage/v1/b/{b}/acl/*",
+        "* /storage/v1/b/{b}/defaultObjectAcl/*",
+        "* /storage/v1/b/{b}/o/**/acl/*",
+        "PATCH /storage/v1/b/{b}",
+        "PUT /storage/v1/b/{b}",
+        "PATCH /storage/v1/b/{b}/o/**",
+        "PUT /storage/v1/b/{b}/o/**"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/storage/v1/projects/p/hmacKeys", "expect": "path_denied" },
+        { "method": "GET", "path": "/storage/v1/projects/p/hmacKeys", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/batch/storage/v1", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.storage.v2.Storage/SetIamPolicy", "expect": "path_denied" },
+        { "method": "PUT", "path": "/storage/v1/b/bkt/iam", "expect": "approval_required" },
+        { "method": "PUT", "path": "/storage/v1/b/bkt/o/dir%2Ffile/iam", "expect": "approval_required" },
+        { "method": "PUT", "path": "/storage/v1/b/bkt/managedFolders/mf/iam", "expect": "approval_required" },
+        { "method": "GET", "path": "/storage/v1/b/bkt/iam", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/storage/v1/b/bkt:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/storage/v1/b/bkt/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/storage/v1/b/bkt/acl", "expect": "approval_required" },
+        { "method": "DELETE", "path": "/storage/v1/b/bkt/acl/allUsers", "expect": "approval_required" },
+        { "method": "GET", "path": "/storage/v1/b/bkt/acl", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/storage/v1/b/bkt/defaultObjectAcl", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/storage/v1/b/bkt/o/dir%2Ffile/acl/allUsers", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/storage/v1/b/bkt", "grant": true, "expect": "approval_required" },
+        { "method": "PUT", "path": "/storage/v1/b/bkt", "expect": "approval_required" },
+        { "method": "GET", "path": "/storage/v1/b/bkt", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/storage/v1/b/bkt/o", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/storage/v1/b/bkt/o/dir%2Ffile", "grant": true, "expect": "run" },
+        { "method": "PATCH", "path": "/storage/v1/b/bkt/o/dir%2Fobj", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/storage/v1/b/bkt/o/obj", "grant": true, "expect": "approval_required" },
+        { "method": "PUT", "path": "/storage/v1/b/bkt/o/dir%2Fobj", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/storage/v1/b/bkt/o/obj", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/storage/v1/b/bkt/o", "expect": "grant_required" },
+        { "method": "DELETE", "path": "/storage/v1/b/bkt/o/obj", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/storage/v1/b/bkt/o/obj/rewriteTo/b/bkt2/o/obj", "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/upload/storage/v1/b/bkt/o", "expect": "path_not_allowed" },
+        { "method": "GET", "path": "/download/storage/v1/b/bkt/o/obj", "grant": true, "expect": "path_not_allowed" },
+        { "method": "PUT", "path": "/bkt/obj", "expect": "path_not_allowed" },
+        { "method": "GET", "path": "/bkt/obj", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Resource Manager",
+      "origin": "https://cloudresourcemanager.googleapis.com",
+      "description": "Cloud Resource Manager API (cloudresourcemanager.googleapis.com), v1 to v3, as the service account: projects, folders, organizations, tags. Read-only regular scope. Denied: batch and $rpc endpoints. One-time approval: setIamPolicy on a project, folder, organization, tag key or tag value; setting and clearing a v1 organization policy (setOrgPolicy, clearOrgPolicy); moving a project or folder (it inherits another parent's IAM policy); creating and deleting tag bindings and patching tag binding collections (a tag can satisfy the condition of an IAM binding).",
+      "paths": ["/v1", "/v2", "/v3"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "* /v1/{scope}/{id}:setOrgPolicy",
+        "* /v1/{scope}/{id}:clearOrgPolicy",
+        "* /{v}/{scope}/{id}:move",
+        "POST /v3/tagBindings",
+        "DELETE /v3/tagBindings/*",
+        "PATCH /v3/locations/{l}/tagBindingCollections/{c}"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v1/projects/p:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v3/projects/p:setIamPolicy", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v3/projects/p%3AsetIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v3/projects/p:SETIAMPOLICY", "expect": "approval_required" },
+        { "method": "POST", "path": "/v3/projects/p:setIamPolicy/", "expect": "approval_required" },
+        { "method": "POST", "path": "/v3/projects/p/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/folders/f:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v3/organizations/o:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v3/tagKeys/k:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v3/tagValues/v:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v3/projects/p:getIamPolicy", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.resourcemanager.v3.Projects/SetIamPolicy", "grant": true, "expect": "path_denied" },
+        { "method": "GET", "path": "/v3/projects/p", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v3/projects/p", "expect": "grant_required" },
+        { "method": "DELETE", "path": "/v3/projects/p", "grant": true, "expect": "method_not_allowed" },
+        { "method": "PATCH", "path": "/v3/projects/p", "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v3/projects/p:move", "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/folders/f:move", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p:setOrgPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/folders/f:setOrgPolicy", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/organizations/o:clearOrgPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p:getOrgPolicy", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v3/tagBindings", "expect": "approval_required" },
+        { "method": "DELETE", "path": "/v3/tagBindings/cloudresourcemanager.googleapis.com%2Fprojects%2F123/tagValues/456", "grant": true, "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v3/locations/us-central1/tagBindingCollections/c", "expect": "approval_required" },
+        { "method": "GET", "path": "/v3/tagBindings", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v3/locations/us-central1/tagBindingCollections/c", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/v3/tagValues/v/tagHolds", "grant": true, "expect": "method_not_allowed" },
+        { "method": "GET", "path": "/$discovery/rest", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Secret Manager",
+      "origin": "https://secretmanager.googleapis.com",
+      "description": "Secret Manager API (secretmanager.googleapis.com), /v1, as the service account. Read-only regular scope: secret and version metadata. Denied: batch and $rpc endpoints. One-time approval: accessing a version's value (:access), and setIamPolicy.",
+      "paths": ["/v1"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": ["* /**/{r}:setIamPolicy", "* /**/setIamPolicy", "GET /**/versions/{v}:access"],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "GET", "path": "/v1/projects/p/secrets/s/versions/latest:access", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/secrets/s/versions/3:access", "grant": true, "expect": "approval_required" },
+        { "method": "HEAD", "path": "/v1/projects/p/secrets/s/versions/1:access", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/secrets/s/versions/1%3Aaccess", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/secrets/s/versions/1:access", "grant": true, "expect": "method_not_allowed" },
+        { "method": "GET", "path": "/v1/projects/p/secrets/s/versions/1", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/secrets", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/secrets", "expect": "grant_required" },
+        { "method": "POST", "path": "/v1/projects/p/secrets/s:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/secrets/s:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/secrets/s/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/secrets/s:addVersion", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/projects/p/secrets", "expect": "method_not_allowed" },
+        { "method": "DELETE", "path": "/v1/projects/p/secrets/s", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.secretmanager.v1.SecretManagerService/AccessSecretVersion", "expect": "path_denied" },
+        { "method": "GET", "path": "/$discovery/rest", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP API Keys",
+      "origin": "https://apikeys.googleapis.com",
+      "description": "API Keys API (apikeys.googleapis.com), /v2, as the service account. Read-only regular scope: key metadata and restrictions. Denied: batch and $rpc endpoints, creating a key and reading a key string (keyString). One-time approval: setIamPolicy.",
+      "paths": ["/v2"],
+      "methods": ["GET", "HEAD"],
+      "deny": [
+        "* /batch/*",
+        "* /$rpc/*",
+        "POST /v2/projects/{p}/locations/{l}/keys",
+        "GET /v2/**/keys/{k}/keyString"
+      ],
+      "approval": ["* /**/{r}:setIamPolicy", "* /**/setIamPolicy"],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v2/projects/p/locations/global/keys", "expect": "path_denied" },
+        { "method": "GET", "path": "/v2/projects/p/locations/global/keys/k/keyString", "grant": true, "expect": "path_denied" },
+        { "method": "HEAD", "path": "/v2/projects/p/locations/global/keys/k/keyString", "grant": true, "expect": "path_denied" },
+        { "method": "GET", "path": "/v2/projects/p/locations/global/keys", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v2/projects/p/locations/global/keys/k", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v2/projects/p/locations/global/keys", "expect": "grant_required" },
+        { "method": "PATCH", "path": "/v2/projects/p/locations/global/keys/k", "grant": true, "expect": "method_not_allowed" },
+        { "method": "DELETE", "path": "/v2/projects/p/locations/global/keys/k", "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v2/projects/p/locations/global/keys/k:undelete", "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v2/projects/p/locations/global/keys/k:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/global/keys/k/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.api.apikeys.v2.ApiKeys/GetKeyString", "expect": "path_denied" },
+        { "method": "GET", "path": "/v1/projects/p/locations/global/keys", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Cloud SQL Admin",
+      "origin": "https://sqladmin.googleapis.com",
+      "description": "Cloud SQL Admin API (sqladmin.googleapis.com), /v1, as the service account. Read-only regular scope; /sql/v1beta4 is outside it, and every rule below covers it too. Denied: batch and $rpc endpoints, client certificates whose private key comes back in the response (generateEphemeralCert, createEphemeral, creating sslCerts). One-time approval: creating, changing (a password) and deleting the users of an instance (listing them runs), resetting the SSL configuration (resetSslConfig), running SQL (executeSql), exporting an instance's data to a bucket (export), and setIamPolicy.",
+      "paths": ["/v1"],
+      "methods": ["GET", "HEAD"],
+      "deny": [
+        "* /batch/*",
+        "* /$rpc/*",
+        "* /**/instances/{i}:generateEphemeralCert",
+        "* /**/instances/{i}/createEphemeral",
+        "POST /v1/projects/{p}/instances/{i}/sslCerts",
+        "POST /sql/v1beta4/projects/{p}/instances/{i}/sslCerts"
+      ],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /v1/projects/{p}/instances/{i}/users",
+        "PUT /v1/projects/{p}/instances/{i}/users",
+        "PATCH /v1/projects/{p}/instances/{i}/users",
+        "DELETE /v1/projects/{p}/instances/{i}/users",
+        "* /v1/projects/{p}/instances/{i}/resetSslConfig",
+        "* /v1/projects/{p}/instances/{i}/executeSql",
+        "* /v1/projects/{p}/instances/{i}/export",
+        "POST /sql/v1beta4/projects/{p}/instances/{i}/users",
+        "PUT /sql/v1beta4/projects/{p}/instances/{i}/users",
+        "PATCH /sql/v1beta4/projects/{p}/instances/{i}/users",
+        "DELETE /sql/v1beta4/projects/{p}/instances/{i}/users",
+        "* /sql/v1beta4/projects/{p}/instances/{i}/resetSslConfig",
+        "* /sql/v1beta4/projects/{p}/instances/{i}/executeSql",
+        "* /sql/v1beta4/projects/{p}/instances/{i}/export"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v1/projects/p/instances/i:generateEphemeralCert", "expect": "path_denied" },
+        { "method": "POST", "path": "/v1/projects/p/instances/i/createEphemeral", "grant": true, "expect": "path_denied" },
+        { "method": "POST", "path": "/v1/projects/p/instances/i/sslCerts", "grant": true, "expect": "path_denied" },
+        { "method": "GET", "path": "/v1/projects/p/instances/i/sslCerts", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/v1/projects/p/instances/i/resetSslConfig", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/instances/i/users", "expect": "approval_required" },
+        { "method": "PUT", "path": "/v1/projects/p/instances/i/users", "expect": "approval_required" },
+        { "method": "DELETE", "path": "/v1/projects/p/instances/i/users", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/instances/i/users", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/v1/projects/p/instances/i/executeSql", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/instances/i/export", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/instances/i/import", "grant": true, "expect": "method_not_allowed" },
+        { "method": "GET", "path": "/v1/projects/p/instances/i", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/instances/i/users/u", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/instances", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/instances", "expect": "grant_required" },
+        { "method": "POST", "path": "/v1/projects/p/instances/i/restart", "grant": true, "expect": "method_not_allowed" },
+        { "method": "DELETE", "path": "/v1/projects/p/instances/i", "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/projects/p/instances/i:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/instances/i/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.sql.v1.SqlConnectService/GenerateEphemeralCert", "expect": "path_denied" },
+        { "method": "GET", "path": "/sql/v1beta4/projects/p/instances", "grant": true, "expect": "path_not_allowed" },
+        { "method": "POST", "path": "/sql/v1beta4/projects/p/instances/i:generateEphemeralCert", "expect": "path_denied" },
+        { "method": "POST", "path": "/sql/v1beta4/projects/p/instances/i/createEphemeral", "grant": true, "expect": "path_denied" },
+        { "method": "POST", "path": "/sql/v1beta4/projects/p/instances/i/sslCerts", "grant": true, "expect": "path_denied" },
+        { "method": "GET", "path": "/sql/v1beta4/projects/p/instances/i/sslCerts", "grant": true, "expect": "path_not_allowed" },
+        { "method": "POST", "path": "/sql/v1beta4/projects/p/instances/i/users", "expect": "approval_required" },
+        { "method": "PUT", "path": "/sql/v1beta4/projects/p/instances/i/users", "grant": true, "expect": "approval_required" },
+        { "method": "DELETE", "path": "/sql/v1beta4/projects/p/instances/i/users", "expect": "approval_required" },
+        { "method": "GET", "path": "/sql/v1beta4/projects/p/instances/i/users", "grant": true, "expect": "path_not_allowed" },
+        { "method": "POST", "path": "/sql/v1beta4/projects/p/instances/i/resetSslConfig", "expect": "approval_required" },
+        { "method": "POST", "path": "/sql/v1beta4/projects/p/instances/i/executeSql", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/sql/v1beta4/projects/p/instances/i/export", "expect": "approval_required" },
+        { "method": "POST", "path": "/sql/v1beta4/projects/p/instances/i:setIamPolicy", "expect": "approval_required" }
+      ]
+    },
+    {
+      "name": "GCP OS Login",
+      "origin": "https://oslogin.googleapis.com",
+      "description": "Cloud OS Login API (oslogin.googleapis.com), /v1, as the service account. Read-only regular scope: login profiles; /v1beta is outside it, and every rule below covers it too. Denied: batch and $rpc endpoints, signing an SSH public key (signSshPublicKey; the response is a signed SSH certificate). One-time approval: adding or changing an SSH public key (importSshPublicKey, creating and patching sshPublicKeys), and setIamPolicy.",
+      "paths": ["/v1"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*", "* /**/{r}:signSshPublicKey"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "* /{v}/users/{u}:importSshPublicKey",
+        "POST /{v}/users/{u}/sshPublicKeys",
+        "PATCH /{v}/users/{u}/sshPublicKeys/{k}"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v1/users/sa@p.iam.gserviceaccount.com:importSshPublicKey", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/users/sa%40p.iam.gserviceaccount.com:importSshPublicKey", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/users/sa@p.iam.gserviceaccount.com/loginProfile", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/users/sa@p.iam.gserviceaccount.com/loginProfile", "expect": "grant_required" },
+        { "method": "POST", "path": "/v1/users/sa@p.iam.gserviceaccount.com/sshPublicKeys", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/users/u/sshPublicKeys/fp", "grant": true, "expect": "run" },
+        { "method": "PATCH", "path": "/v1/users/sa@p.iam.gserviceaccount.com/sshPublicKeys/fp", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v1/users/u/sshPublicKeys/fp", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l:signSshPublicKey", "expect": "path_denied" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l%3AsignSshPublicKey", "grant": true, "expect": "path_denied" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l", "grant": true, "expect": "run" },
+        { "method": "DELETE", "path": "/v1/users/u/sshPublicKeys/fp", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/users/u:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/users/u/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.oslogin.v1.OsLoginService/ImportSshPublicKey", "expect": "path_denied" },
+        { "method": "GET", "path": "/v1beta/users/u/loginProfile", "grant": true, "expect": "path_not_allowed" },
+        { "method": "POST", "path": "/v1beta/users/sa@p.iam.gserviceaccount.com:importSshPublicKey", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1beta/users/u/sshPublicKeys", "grant": true, "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v1beta/users/u/sshPublicKeys/fp", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1beta/projects/p/locations/l:signSshPublicKey", "expect": "path_denied" },
+        { "method": "POST", "path": "/v1beta/users/u/projects/p/locations/l:signSshPublicKey", "grant": true, "expect": "path_denied" },
+        { "method": "POST", "path": "/v1beta/users/u/projects/p/zones/z:signSshPublicKey", "expect": "path_denied" },
+        { "method": "POST", "path": "/v1beta/users/u:setIamPolicy", "expect": "approval_required" }
+      ]
+    },
+    {
+      "name": "GCP Organization Policy",
+      "origin": "https://orgpolicy.googleapis.com",
+      "description": "Organization Policy API (orgpolicy.googleapis.com), /v2, as the service account. Read-only regular scope: constraints. Denied: batch and $rpc endpoints. One-time approval: creating, changing and deleting the policies of a project, folder or organization (reading them runs), and setIamPolicy.",
+      "paths": ["/v2"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /v2/{scope}/{id}/policies/*",
+        "PUT /v2/{scope}/{id}/policies/*",
+        "PATCH /v2/{scope}/{id}/policies/*",
+        "DELETE /v2/{scope}/{id}/policies/*"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v2/projects/p/policies", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v2/organizations/o/policies/compute.vmExternalIpAccess", "grant": true, "expect": "approval_required" },
+        { "method": "DELETE", "path": "/v2/folders/f/policies/compute.vmExternalIpAccess", "expect": "approval_required" },
+        { "method": "GET", "path": "/v2/projects/p/policies", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v2/organizations/o/policies/compute.vmExternalIpAccess", "grant": true, "expect": "run" },
+        { "method": "PUT", "path": "/v2/projects/p/policies/compute.vmExternalIpAccess", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v2/projects/p/constraints", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v2/projects/p/constraints", "expect": "grant_required" },
+        { "method": "POST", "path": "/v2/organizations/o/customConstraints", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v2/projects/p:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.orgpolicy.v2.OrgPolicy/CreatePolicy", "expect": "path_denied" },
+        { "method": "GET", "path": "/v1/projects/p/policies", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Cloud Functions",
+      "origin": "https://cloudfunctions.googleapis.com",
+      "description": "Cloud Functions API (cloudfunctions.googleapis.com), v1 and v2, as the service account. Read-only regular scope. Denied: batch and $rpc endpoints, generateDownloadUrl (its response is a signed URL to the function's source). One-time approval: creating and patching a function (its body names the service account it runs as and its source), calling a v1 function (:call), and setIamPolicy.",
+      "paths": ["/v1", "/v2"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*", "* /{v}/projects/{p}/locations/{l}/functions/{f}:generateDownloadUrl"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /{v}/projects/{p}/locations/{l}/functions",
+        "PATCH /{v}/projects/{p}/locations/{l}/functions/{f}",
+        "* /{v}/projects/{p}/locations/{l}/functions/{f}:call"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v2/projects/p/locations/l/functions", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/functions", "grant": true, "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v2/projects/p/locations/l/functions/f", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v1/projects/p/locations/l/functions/f", "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/functions/f:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/functions/f/setIamPolicy", "expect": "approval_required" },
+        { "method": "GET", "path": "/v2/projects/p/locations/l/functions", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v2/projects/p/locations/l/functions/f", "expect": "grant_required" },
+        { "method": "DELETE", "path": "/v2/projects/p/locations/l/functions/f", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/functions:generateUploadUrl", "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/functions/f:generateDownloadUrl", "expect": "path_denied" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/functions/f:generateDownloadUrl", "grant": true, "expect": "path_denied" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/functions/f:call", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/functions/f", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.functions.v2.FunctionService/CreateFunction", "expect": "path_denied" },
+        { "method": "GET", "path": "/v2beta/projects/p/locations/l/functions", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Cloud Run",
+      "origin": "https://run.googleapis.com",
+      "description": "Cloud Run Admin API (run.googleapis.com), /v2, as the service account. Read-only regular scope; the v1 paths (/v1 and the Knative-style /apis/serving.knative.dev/v1 and /apis/run.googleapis.com/v1) are outside it. Denied: batch and $rpc endpoints. One-time approval (the body names the service account and the image, or overrides what a job runs): creating, patching or replacing services, jobs, worker pools and instances in v2 and v1, running a job (:run), submitting a build (builds:submit), and setIamPolicy.",
+      "paths": ["/v2"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /{v}/projects/{p}/locations/{l}/services",
+        "PATCH /v2/projects/{p}/locations/{l}/services/{s}",
+        "PUT /v1/projects/{p}/locations/{l}/services/{s}",
+        "POST /v2/projects/{p}/locations/{l}/jobs",
+        "PATCH /v2/projects/{p}/locations/{l}/jobs/{j}",
+        "* /**/jobs/{j}:run",
+        "POST /v2/projects/{p}/locations/{l}/workerPools",
+        "PATCH /v2/projects/{p}/locations/{l}/workerPools/{w}",
+        "POST /v2/projects/{p}/locations/{l}/instances",
+        "PATCH /v2/projects/{p}/locations/{l}/instances/{i}",
+        "POST /v2/projects/{p}/locations/{l}/builds:submit",
+        "POST /apis/serving.knative.dev/v1/namespaces/{ns}/services",
+        "PUT /apis/serving.knative.dev/v1/namespaces/{ns}/services/{s}",
+        "POST /apis/run.googleapis.com/v1/namespaces/{ns}/jobs",
+        "PUT /apis/run.googleapis.com/v1/namespaces/{ns}/jobs/{j}",
+        "POST /apis/run.googleapis.com/v1/namespaces/{ns}/workerpools",
+        "PUT /apis/run.googleapis.com/v1/namespaces/{ns}/workerpools/{w}",
+        "POST /apis/run.googleapis.com/v1/namespaces/{ns}/instances",
+        "PUT /apis/run.googleapis.com/v1/namespaces/{ns}/instances/{i}"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v2/projects/p/locations/l/services", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v2/projects/p/locations/l/services/s", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/jobs", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v2/projects/p/locations/l/jobs/j", "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/workerPools", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v2/projects/p/locations/l/workerPools/w", "expect": "approval_required" },
+        { "method": "POST", "path": "/apis/serving.knative.dev/v1/namespaces/p/services", "expect": "approval_required" },
+        { "method": "PUT", "path": "/apis/serving.knative.dev/v1/namespaces/p/services/s", "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/services/s:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/services/s:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/services/s/setIamPolicy", "expect": "approval_required" },
+        { "method": "GET", "path": "/v2/projects/p/locations/l/services", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v2/projects/p/locations/l/services/s", "expect": "grant_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/jobs/j:run", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/apis/run.googleapis.com/v1/namespaces/p/jobs/j:run", "expect": "approval_required" },
+        { "method": "GET", "path": "/v2/projects/p/locations/l/jobs/j", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/jobs/j/executions/e:cancel", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/instances", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v2/projects/p/locations/l/instances/i", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v2/projects/p/locations/l/instances/i", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/instances/i:stop", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/builds:submit", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/services", "expect": "approval_required" },
+        { "method": "PUT", "path": "/v1/projects/p/locations/l/services/s", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/apis/run.googleapis.com/v1/namespaces/p/jobs", "expect": "approval_required" },
+        { "method": "PUT", "path": "/apis/run.googleapis.com/v1/namespaces/p/jobs/j", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/apis/run.googleapis.com/v1/namespaces/p/workerpools", "expect": "approval_required" },
+        { "method": "PUT", "path": "/apis/run.googleapis.com/v1/namespaces/p/workerpools/w", "expect": "approval_required" },
+        { "method": "POST", "path": "/apis/run.googleapis.com/v1/namespaces/p/instances", "expect": "approval_required" },
+        { "method": "PUT", "path": "/apis/run.googleapis.com/v1/namespaces/p/instances/i", "grant": true, "expect": "approval_required" },
+        { "method": "DELETE", "path": "/v2/projects/p/locations/l/services/s", "expect": "method_not_allowed" },
+        { "method": "GET", "path": "/apis/serving.knative.dev/v1/namespaces/p/services", "grant": true, "expect": "path_not_allowed" },
+        { "method": "GET", "path": "/apis/run.googleapis.com/v1/namespaces/p/jobs/j", "grant": true, "expect": "path_not_allowed" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.run.v2.Services/CreateService", "expect": "path_denied" }
+      ]
+    },
+    {
+      "name": "GCP Cloud Build",
+      "origin": "https://cloudbuild.googleapis.com",
+      "description": "Cloud Build API (cloudbuild.googleapis.com), /v1, as the service account. Read-only regular scope. Denied: batch and $rpc endpoints. One-time approval: creating a build, creating, patching, running and firing the webhook of a trigger (the body names the service account and arbitrary build steps), approving a build that waits for approval (:approve), reading Bitbucket Server and GitHub Enterprise configurations (they hold an API key and a webhook key), and setIamPolicy.",
+      "paths": ["/v1"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /v1/**/builds",
+        "POST /v1/**/triggers",
+        "PATCH /v1/**/triggers/{t}",
+        "POST /v1/**/triggers/{t}:run",
+        "* /v1/**/triggers/{t}:webhook",
+        "* /v1/**/builds/{b}:approve",
+        "GET /v1/**/bitbucketServerConfigs/*",
+        "GET /v1/**/githubEnterpriseConfigs/*"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v1/projects/p/builds", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/builds", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/triggers", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v1/projects/p/locations/l/triggers/t", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/triggers/t:run", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/triggers/t:run", "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/builds", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/builds/b", "expect": "grant_required" },
+        { "method": "POST", "path": "/v1/projects/p/builds/b:cancel", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/builds/b:approve", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/builds/b:approve", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/triggers/t:webhook", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/triggers/t:webhook", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/triggers/t", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/bitbucketServerConfigs/c", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/bitbucketServerConfigs", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/githubEnterpriseConfigs/c", "grant": true, "expect": "approval_required" },
+        { "method": "HEAD", "path": "/v1/projects/p/locations/l/githubEnterpriseConfigs", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/connections/c", "grant": true, "expect": "run" },
+        { "method": "DELETE", "path": "/v1/projects/p/triggers/t", "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/connections/c:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/connections/c/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.devtools.cloudbuild.v1.CloudBuild/CreateBuild", "expect": "path_denied" },
+        { "method": "GET", "path": "/v2/projects/p/locations/l/connections", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Cloud Scheduler",
+      "origin": "https://cloudscheduler.googleapis.com",
+      "description": "Cloud Scheduler API (cloudscheduler.googleapis.com), /v1, as the service account. Read-only regular scope. Denied: batch and $rpc endpoints. One-time approval: creating and patching a job (its body can call any URL with a service account's OIDC or OAuth token), and setIamPolicy.",
+      "paths": ["/v1"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /v1/projects/{p}/locations/{l}/jobs",
+        "PATCH /v1/projects/{p}/locations/{l}/jobs/{j}"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v1/projects/p/locations/l/jobs", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v1/projects/p/locations/l/jobs/j", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/jobs", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/jobs/j", "expect": "grant_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/jobs/j:run", "grant": true, "expect": "method_not_allowed" },
+        { "method": "DELETE", "path": "/v1/projects/p/locations/l/jobs/j", "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/jobs/j:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/jobs/j/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.scheduler.v1.CloudScheduler/CreateJob", "expect": "path_denied" },
+        { "method": "GET", "path": "/v1beta1/projects/p/locations/l/jobs", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Cloud Tasks",
+      "origin": "https://cloudtasks.googleapis.com",
+      "description": "Cloud Tasks API (cloudtasks.googleapis.com), /v2, as the service account. Read-only regular scope. Denied: batch and $rpc endpoints. One-time approval: creating a task one at a time or in a batch and buffering one (:buffer), creating and patching a queue (its httpTarget can add a service account's OAuth or OIDC token and override the URL of every task), and setIamPolicy. Each of these can send a service account's token to any URL.",
+      "paths": ["/v2"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /v2/projects/{p}/locations/{l}/queues/{q}/tasks",
+        "POST /v2/projects/{p}/locations/{l}/queues/{q}/tasks:batchCreate",
+        "* /v2/projects/{p}/locations/{l}/queues/{q}/tasks/{t}:buffer",
+        "POST /v2/projects/{p}/locations/{l}/queues",
+        "PATCH /v2/projects/{p}/locations/{l}/queues/{q}"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v2/projects/p/locations/l/queues/q/tasks", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/queues/q:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/queues/q/setIamPolicy", "expect": "approval_required" },
+        { "method": "GET", "path": "/v2/projects/p/locations/l/queues/q/tasks", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v2/projects/p/locations/l/queues", "expect": "grant_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/queues/q/tasks:batchCreate", "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/queues/q/tasks/t:buffer", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/queues/q/tasks/-:buffer", "expect": "approval_required" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/queues", "grant": true, "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v2/projects/p/locations/l/queues/q", "expect": "approval_required" },
+        { "method": "GET", "path": "/v2/projects/p/locations/l/queues/q", "grant": true, "expect": "run" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/queues/q:pause", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/queues/q/tasks:batchDelete", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v2/projects/p/locations/l/queues/q/tasks/t:run", "expect": "method_not_allowed" },
+        { "method": "DELETE", "path": "/v2/projects/p/locations/l/queues/q", "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.tasks.v2.CloudTasks/CreateTask", "expect": "path_denied" },
+        { "method": "GET", "path": "/v2beta3/projects/p/locations/l/queues", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Workflows",
+      "origin": "https://workflows.googleapis.com",
+      "description": "Workflows API (workflows.googleapis.com), /v1, as the service account: workflow definitions. Executions are on the connection GCP Workflow Executions. Read-only regular scope. Denied: batch and $rpc endpoints. One-time approval: creating and patching a workflow (its body names the service account and source that can call any Google API), and setIamPolicy.",
+      "paths": ["/v1"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /v1/projects/{p}/locations/{l}/workflows",
+        "PATCH /v1/projects/{p}/locations/{l}/workflows/{w}"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v1/projects/p/locations/l/workflows", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v1/projects/p/locations/l/workflows/w", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/workflows", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/workflows/w", "expect": "grant_required" },
+        { "method": "DELETE", "path": "/v1/projects/p/locations/l/workflows/w", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/workflows/w:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/workflows/w/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.workflows.v1.Workflows/CreateWorkflow", "expect": "path_denied" },
+        { "method": "GET", "path": "/v1beta/projects/p/locations/l/workflows", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Workflow Executions",
+      "origin": "https://workflowexecutions.googleapis.com",
+      "description": "Workflow Executions API (workflowexecutions.googleapis.com), /v1, as the service account: executions of deployed workflows. Read-only regular scope. Denied: batch and $rpc endpoints. One-time approval: starting an execution, directly or as a Pub/Sub trigger would (triggerPubsubExecution; the workflow runs as its service account), and setIamPolicy.",
+      "paths": ["/v1"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /v1/projects/{p}/locations/{l}/workflows/{w}/executions",
+        "* /v1/projects/{p}/locations/{l}/workflows/{w}:triggerPubsubExecution"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v1/projects/p/locations/l/workflows/w/executions", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/workflows/w/executions", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/workflows/w/executions/e", "expect": "grant_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/workflows/w/executions/e:cancel", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/workflows/w:triggerPubsubExecution", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/workflows/w%3AtriggerPubsubExecution", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/workflows/w:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/workflows/w/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.workflows.executions.v1.Executions/CreateExecution", "expect": "path_denied" },
+        { "method": "GET", "path": "/v1beta/projects/p/locations/l/workflows/w/executions", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Dataflow",
+      "origin": "https://dataflow.googleapis.com",
+      "description": "Dataflow API (dataflow.googleapis.com), /v1b3, as the service account. Read-only regular scope. Denied: batch and $rpc endpoints. One-time approval: creating a job, creating or launching a template, launching a flex template (the body names the service account and the pipeline), and setIamPolicy.",
+      "paths": ["/v1b3"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /v1b3/**/jobs",
+        "POST /v1b3/**/templates",
+        "POST /v1b3/**/templates:launch",
+        "POST /v1b3/**/flexTemplates:launch"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v1b3/projects/p/jobs", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1b3/projects/p/locations/l/jobs", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v1b3/projects/p/templates", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1b3/projects/p/locations/l/templates:launch", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1b3/projects/p/locations/l/flexTemplates:launch", "expect": "approval_required" },
+        { "method": "GET", "path": "/v1b3/projects/p/locations/l/jobs", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1b3/projects/p/locations/l/jobs/j", "expect": "grant_required" },
+        { "method": "PUT", "path": "/v1b3/projects/p/locations/l/jobs/j", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1b3/projects/p/locations/l/jobs/j:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1b3/projects/p/locations/l/jobs/j/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.dataflow.v1beta3.FlexTemplatesService/LaunchFlexTemplate", "expect": "path_denied" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/jobs", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Cloud Composer",
+      "origin": "https://composer.googleapis.com",
+      "description": "Cloud Composer API (composer.googleapis.com), /v1, as the service account. Read-only regular scope. Denied: batch and $rpc endpoints. One-time approval: creating and patching an environment (its body names the nodes' service account), running an Airflow command in it (executeAirflowCommand), loading and saving a snapshot (loadSnapshot replaces its DAGs and configuration), and setIamPolicy.",
+      "paths": ["/v1"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /v1/projects/{p}/locations/{l}/environments",
+        "PATCH /v1/projects/{p}/locations/{l}/environments/{e}",
+        "* /v1/projects/{p}/locations/{l}/environments/{e}:executeAirflowCommand",
+        "* /v1/projects/{p}/locations/{l}/environments/{e}:loadSnapshot",
+        "* /v1/projects/{p}/locations/{l}/environments/{e}:saveSnapshot"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v1/projects/p/locations/l/environments", "expect": "approval_required" },
+        { "method": "PATCH", "path": "/v1/projects/p/locations/l/environments/e", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/environments", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/environments/e", "expect": "grant_required" },
+        { "method": "DELETE", "path": "/v1/projects/p/locations/l/environments/e", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/environments/e:executeAirflowCommand", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/environments/e:loadSnapshot", "grant": true, "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/environments/e:saveSnapshot", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/environments/e:pollAirflowCommand", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/environments/e:restartWebServer", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/environments/e:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/environments/e/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.orchestration.airflow.service.v1.Environments/CreateEnvironment", "expect": "path_denied" },
+        { "method": "GET", "path": "/v1beta1/projects/p/locations/l/environments", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Batch",
+      "origin": "https://batch.googleapis.com",
+      "description": "Batch API (batch.googleapis.com), /v1, as the service account. Read-only regular scope. Denied: batch and $rpc endpoints. One-time approval: creating a job (its body names the service account and the runnables), and setIamPolicy.",
+      "paths": ["/v1"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": ["* /**/{r}:setIamPolicy", "* /**/setIamPolicy", "POST /v1/projects/{p}/locations/{l}/jobs"],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/v1/projects/p/locations/l/jobs", "grant": true, "expect": "approval_required" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/jobs", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/v1/projects/p/locations/l/jobs/j", "expect": "grant_required" },
+        { "method": "DELETE", "path": "/v1/projects/p/locations/l/jobs/j", "grant": true, "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/jobs/j:setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/v1/projects/p/locations/l/jobs/j/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.batch.v1.BatchService/CreateJob", "expect": "path_denied" },
+        { "method": "GET", "path": "/v1alpha/projects/p/locations/l/jobs", "grant": true, "expect": "path_not_allowed" }
+      ]
+    },
+    {
+      "name": "GCP Deployment Manager",
+      "origin": "https://deploymentmanager.googleapis.com",
+      "description": "Cloud Deployment Manager API (deploymentmanager.googleapis.com), /deploymentmanager/v2, as the service account. Read-only regular scope. Denied: batch and $rpc endpoints. One-time approval: creating, replacing and patching a deployment (its configuration can create any resource, IAM bindings and service account keys included, as the Google APIs service agent), and setIamPolicy.",
+      "paths": ["/deploymentmanager/v2"],
+      "methods": ["GET", "HEAD"],
+      "deny": ["* /batch/*", "* /$rpc/*"],
+      "approval": [
+        "* /**/{r}:setIamPolicy",
+        "* /**/setIamPolicy",
+        "POST /deploymentmanager/v2/projects/{p}/global/deployments",
+        "PUT /deploymentmanager/v2/projects/{p}/global/deployments/{d}",
+        "PATCH /deploymentmanager/v2/projects/{p}/global/deployments/{d}"
+      ],
+      "auth": {
+        "type": "oauth-jwt",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "jwt": {
+          "alg": "RS256",
+          "keyField": "private_key",
+          "header": { "kid": { "$field": "private_key_id" } },
+          "claims": {
+            "iss": { "$field": "client_email" },
+            "scope": "https://www.googleapis.com/auth/cloud-platform",
+            "aud": "https://oauth2.googleapis.com/token"
+          },
+          "lifetime": 3600
+        }
+      },
+      "tests": [
+        { "method": "POST", "path": "/deploymentmanager/v2/projects/p/global/deployments", "expect": "approval_required" },
+        { "method": "PUT", "path": "/deploymentmanager/v2/projects/p/global/deployments/d", "grant": true, "expect": "approval_required" },
+        { "method": "PATCH", "path": "/deploymentmanager/v2/projects/p/global/deployments/d", "expect": "approval_required" },
+        { "method": "POST", "path": "/deploymentmanager/v2/projects/p/global/deployments/d/setIamPolicy", "expect": "approval_required" },
+        { "method": "POST", "path": "/deploymentmanager/v2/projects/p/global/deployments/d:setIamPolicy", "expect": "approval_required" },
+        { "method": "GET", "path": "/deploymentmanager/v2/projects/p/global/deployments", "grant": true, "expect": "run" },
+        { "method": "GET", "path": "/deploymentmanager/v2/projects/p/global/deployments/d", "expect": "grant_required" },
+        { "method": "POST", "path": "/deploymentmanager/v2/projects/p/global/deployments/d/stop", "grant": true, "expect": "method_not_allowed" },
+        { "method": "DELETE", "path": "/deploymentmanager/v2/projects/p/global/deployments/d", "expect": "method_not_allowed" },
+        { "method": "POST", "path": "/batch", "expect": "path_denied" },
+        { "method": "POST", "path": "/$rpc/google.cloud.deploymentmanager.v2.Deployments/Insert", "expect": "path_denied" },
+        { "method": "GET", "path": "/deploymentmanager/v2beta/projects/p/global/deployments", "grant": true, "expect": "path_not_allowed" }
+      ]
+    }
+  ]
+}

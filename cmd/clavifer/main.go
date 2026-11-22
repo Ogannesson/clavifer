@@ -26,7 +26,7 @@ import (
 
 const service = "clavifer"
 const maxResponse = 2 * 1024 * 1024
-const cliVersion = "0.5.0"
+const cliVersion = "0.6.0"
 const deviceGrant = "urn:ietf:params:oauth:grant-type:device_code"
 
 type profile struct {
@@ -44,7 +44,10 @@ var credentialGet = keyring.Get
 var credentialSet = keyring.Set
 var credentialDelete = keyring.Delete
 var userConfigDir = os.UserConfigDir
-var httpClient = &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
+
+// A connection request may take 20 seconds to get its token and 20 more upstream, so the client
+// waits longer than both.
+var httpClient = &http.Client{Timeout: 45 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
 var selectedProfile = "default"
 var profileName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 

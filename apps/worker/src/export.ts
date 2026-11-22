@@ -76,7 +76,7 @@ export function serialized(records: (SnapshotRecord | ArchiveHeader)[]) {
 }
 
 /** The snapshot of this instance as the automatic backup carries it: every record, read in one batch,
- * checked against the v1 schemas and for the references an import requires, with each sealed segment
+ * checked against the v2 schemas and for the references an import requires, with each sealed segment
  * named by its key in the bucket. A full export is the same snapshot with each segment's file in place
  * of its key. revision is the backup revision as of the same read. A failed check refuses the snapshot
  * whole, so neither an export nor a backup is ever written from an inconsistent instance. */
@@ -279,7 +279,7 @@ export async function snapshot(env: Bindings, owner: string) {
   return { records, revision: Number(state[0].revision) };
 }
 
-/** Streams the complete state of this instance as a v1 full snapshot, age-encrypted to recipient: the
+/** Streams the complete state of this instance as a v2 full snapshot, age-encrypted to recipient: the
  * snapshot of the automatic backup with every sealed segment's file embedded. Nothing is written before
  * every record passed its checks and every segment was found in the bucket with the checksum its
  * manifest row recorded; a refusal is audited under the export id, since a download link gives the

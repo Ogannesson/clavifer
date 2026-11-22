@@ -73,12 +73,12 @@ MCP 服务有四个工具：`credentials.list`、`access.request`、`access.stat
 
 ## Owner 能控制什么
 
-- **连接。** 一个[连接](docs/connections.md#what-a-connection-holds)包含固定的 HTTPS 上游地址、凭据的加入方式（不加、Bearer 令牌、请求头、Basic 认证、查询参数五种之一）、允许的路径和方法，以及三类规则：拒绝、必须审批、免审批。命中免审批规则的请求不需要任何授权就能通过。
+- **连接。** 一个[连接](docs/connections.md#what-a-connection-holds)包含固定的 HTTPS 上游地址、凭据的加入方式（九种之一）、允许的路径和方法，以及三类规则：拒绝、必须审批、免审批。除了不加凭据，有四种把存着的值原样发出（Bearer 令牌、请求头、Basic 认证、查询参数），另外四种由服务端用存着的凭据现场生成一个短期凭据：每个请求现签一个 JWT，或者拿客户端凭据、JWT 断言、refresh token 向 token 端点换一个 access token。用 refresh token 的连接，Owner 可以在管理网页上发起到上游的授权，服务端把拿到的 refresh token 存下来。命中免审批规则的请求不需要任何授权就能通过。规则路径可以用 `{名字}` 匹配一段，用 `**` 匹配任意多段。
 - **授权。** 一项[授权](docs/connections.md#grants)授予一个安装实例，对象是一个连接或一份凭据。有效期由 Owner 选定，也可以不设期限、一直有效到撤销；撤销从下一个请求起生效。读取凭据的授权可以只限其中几个字段。
 - **申请。** Agent 可以提交[申请](docs/connections.md#access-requests)：申请一项授权，申请在连接允许的路径和方法之外临时扩展范围，或者申请对某一个确定的请求做单次审批。单次审批在 10 分钟内有效，只能执行一次。
 - **草案。** Agent 可以提交[草案](docs/connections.md#drafts)：新建一份凭据和使用它的连接，或者修改一个连接，并附上测试用例。服务端在草案提交时就用真实的判定逻辑跑这些测试。凭据的值由 Owner 在批准时填写。
 - **其他地址。** 有的 API 会把请求引到另一个域名，例如下载用的域名。为此，连接可以登记[额外域名，或者允许任意地址](docs/connections.md#requests-to-another-origin)。凭据只会随 Owner 逐个批准过的请求（单次审批）发往这些地址，每次批准只对那一个地址有效。
-- **近期登录。** Owner 用密码或 Passkey 登录。敏感操作，例如新增授权、批准申请、新建或修改连接、下载完整导出、更换备份接收者，都[要求最近 10 分钟内登录过](docs/authentication.md#operations-that-need-a-recent-sign-in)。
+- **近期登录。** Owner 用密码或 Passkey 登录。敏感操作，例如新增授权、批准申请、新建或修改连接、发起连接到上游的授权、下载完整导出、更换备份接收者，都[要求最近 10 分钟内登录过](docs/authentication.md#operations-that-need-a-recent-sign-in)。
 - **加密、备份和审计。** [凭据的值在写入数据库之前就已加密](docs/security-model.md#how-secrets-are-stored)，所用的密钥由服务唯一的 Worker secret（根密钥）派生而来。[备份](docs/security-model.md#backups)是整个实例的快照，用 age 公钥加密：服务自动写入 R2，Owner 也可以下载完整导出；两者都能导入一套新实例，用于迁移，或者在根密钥丢失后恢复。每条[审计记录](docs/security-model.md#audit-log)都带请求编号，和响应头 `x-request-id` 一致；旧记录会移进加密的归档文件，不会删除。
 
 ## 上手
@@ -113,7 +113,7 @@ MCP 服务有四个工具：`credentials.list`、`access.request`、`access.stat
 - 只有一个 Owner，没有其他用户和角色，也没有邮件找回。
 - 管理网页只有中文界面。英文文档引用界面文字时附英文解释。
 - 命令行客户端以 Windows 为先，在 Windows 上配合 Claude Code 和 Codex 验证过。macOS 和 Linux 能编译，但没有在真机上运行过，也没有安装脚本。
-- 有两类上游没法直接接入：一是拒绝来自 Cloudflare Workers 的请求的上游；二是需要的不只是固定凭据的上游，例如要求请求签名或客户端证书。详见 [docs/connections.md](docs/connections.md#upstreams-that-cannot-be-connected)。
+- 有两类上游没法直接接入：一是拒绝来自 Cloudflare Workers 的请求的上游；二是要求对每个请求签名（AWS Signature Version 4、HMAC 类）或要求客户端证书的上游。路径规则也看不见写在请求体里的操作。详见 [docs/connections.md](docs/connections.md#upstreams-that-cannot-be-connected)。
 - 服务把上游的响应原样返回，不检查上游是否回显了凭据，所以只应接入可信的上游。
 - 服务端的根密钥没有轮换流程，也不存在任何副本。根密钥丢失时，要用最近一次自动备份重建实例，这次备份之后的改动会丢失。
 - Clavifer 限制 agent 能碰到什么，但不判断意图。在授权范围内，agent 可以发出任何没有命中拒绝规则或审批规则的请求。

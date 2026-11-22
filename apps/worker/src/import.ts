@@ -11,14 +11,17 @@ import {
   type Envelope,
 } from '../../../packages/core/crypto';
 import { Fault, assert } from '../../../packages/core/errors';
+import { requiredFields, type Auth } from '../../../packages/core/auth';
 import {
   COUNTED_TYPES,
   SCRYPT,
-  snapshotRecord,
+  parseRecord,
+  snapshotFormat,
   type RecordOf,
+  type SnapshotFormat,
   type SnapshotRecord,
 } from '../../../packages/core/snapshot';
-import { type Bindings, auditStatement, id, issuesHint, now, rootKeys } from './context';
+import { type Bindings, auditStatement, id, now, rootKeys } from './context';
 import { clearOut, consumeToken, deleteToken, tokenGuard, tokenState } from './setup';
 import { segmentKey, segmentPrefix } from './archive';
 
@@ -31,8 +34,8 @@ import { segmentKey, segmentPrefix } from './archive';
 // tightens a rule converts the stored rows and imported ones alike.
 
 // The import in progress is system_state import_id: {id, owner, header}, the whole owner record kept for
-// the commit. Like the token, its id is a bearer credential: 128 random bits, only ever in request and
-// response bodies.
+// the commit and the header for the format every later record is read in. Like the token, its id is a
+// bearer credential: 128 random bits, only ever in request and response bodies.
 export const importId = z.string().regex(/^[A-Za-z0-9_-]{22}$/);
 export const startInput = z.object({ header: z.unknown(), owner: z.unknown() });
 export const chunkInput = z.object({
@@ -50,16 +53,20 @@ export const commitInput = z.object({
 });
 type Import = { id: string; owner: RecordOf<'owner'>; header: RecordOf<'header'> };
 
-function parse<T extends SnapshotRecord['type']>(value: unknown, types: readonly T[], what: string) {
-  const parsed = snapshotRecord.safeParse(value);
-  if (!parsed.success) throw new Fault('invalid_snapshot', 400, `${what}: ${issuesHint(parsed.error)}`);
+function parse<T extends SnapshotRecord['type']>(
+  format: SnapshotFormat,
+  value: unknown,
+  types: readonly T[],
+  what: string,
+) {
+  const record = parseRecord(format, value, what);
   assert(
-    (types as readonly string[]).includes(parsed.data.type),
+    (types as readonly string[]).includes(record.type),
     'invalid_snapshot',
     400,
-    `${what}: a ${parsed.data.type} record does not belong here`,
+    `${what}: a ${record.type} record does not belong here`,
   );
-  return parsed.data as RecordOf<T>;
+  return record as RecordOf<T>;
 }
 const superseded = () =>
   new Fault(
@@ -100,8 +107,8 @@ async function guarded(env: Bindings, importId: string, statements: D1PreparedSt
  * header and owner records these are. Returns the import id. */
 export async function startImport(env: Bindings, token: string | undefined, input: z.infer<typeof startInput>) {
   assert(!(await tokenState(env, token)).owner, 'already_initialized', 409);
-  const header = parse(input.header, ['header'], 'header');
-  const owner = parse(input.owner, ['owner'], 'owner');
+  const header = parse(snapshotFormat(input.header), input.header, ['header'], 'header');
+  const owner = parse(header.format, input.owner, ['owner'], 'owner');
   // The stored key verifies only under the parameters it was derived with, and the library has its own.
   assert(
     Object.entries(SCRYPT).every(([name, value]) => owner.password[name as keyof typeof SCRYPT] === value),
@@ -211,7 +218,7 @@ export async function importChunk(env: Bindings, input: z.infer<typeof chunkInpu
     Table,
     unknown[][]
   >;
-  const records = input.records.map((value, i) => parse(value, BULK, `record ${i + 1}`));
+  const records = input.records.map((value, i) => parse(header.format, value, BULK, `record ${i + 1}`));
   await Promise.all(
     records.map(async (r, i): Promise<void> => {
       if (r.type === 'secret')
@@ -377,10 +384,12 @@ export async function commitImport(env: Bindings, input: z.infer<typeof commitIn
     .first<{ value: string }>();
   if (!current) throw superseded();
   const { owner, header } = JSON.parse(current.value) as Import;
-  const settings = parse(input.settings, ['settings'], 'settings');
+  const settings = parse(header.format, input.settings, ['settings'], 'settings');
   const identity =
-    input.archiveIdentity === null ? null : parse(input.archiveIdentity, ['archive-identity'], 'archive-identity');
-  const end = parse(input.end, ['end'], 'end');
+    input.archiveIdentity === null
+      ? null
+      : parse(header.format, input.archiveIdentity, ['archive-identity'], 'archive-identity');
+  const end = parse(header.format, input.end, ['end'], 'end');
 
   // Read in one batch, which the final one repeats only in its guard: these checks hold for what is written
   // as long as no chunk arrived since, so the guard requires the chunks counted here.
@@ -439,12 +448,6 @@ LIMIT 1`,
   if (versions.length) throw inconsistent(`secret ${versions[0].id} does not have exactly its versions`);
   const ring = rootKeys(env);
   for (const c of bound) {
-    const auth = JSON.parse(c.auth_json as string) as {
-      type: string;
-      field?: string;
-      usernameField?: string;
-      passwordField?: string;
-    };
     const values = c.envelope_json
       ? await decryptSecret(
           ring,
@@ -452,7 +455,7 @@ LIMIT 1`,
           JSON.parse(c.envelope_json as string) as Envelope,
         )
       : null;
-    const fields = auth.type === 'basic' ? [auth.usernameField!, auth.passwordField!] : [auth.field!];
+    const fields = requiredFields(JSON.parse(c.auth_json as string) as Auth);
     if (!values || !fields.every((field) => Object.hasOwn(values, field)))
       throw inconsistent(`connection ${c.id} injects a credential or field the snapshot lacks`);
   }

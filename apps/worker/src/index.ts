@@ -21,6 +21,8 @@ import {
   auditStatement,
   readJson,
   withRequestId,
+  withContext,
+  finish,
   issuesHint,
   VERSION,
 } from './context';
@@ -39,16 +41,20 @@ import {
   resourceId,
   boundSecret,
   validateAuthBinding,
+  authEndpoints,
   policyJson,
   liveExtensions,
   requestedExtension,
-  valuesSchema,
+  setupValues,
+  completeInput,
   withChanges,
   type ConnectionRow,
   type ConnectionPolicy,
   type StoredRequest,
 } from './vault';
 import { handleMcp } from './mcp';
+import { callbackUrl, completeAuthorization, startAuthorization, testCredential } from './token';
+import { authorizes, exchanges, recipe, requiredFields, type Auth } from '../../../packages/core/auth';
 import { backupStatus, configureBackup, runAutomaticBackup, downloadLatestBackup } from './backup';
 import { exportId, fullExport, exportStatus, recipientInput } from './export';
 import { sealColdData } from './archive';
@@ -56,7 +62,8 @@ import { tokenState, createOwner, resetOwner, ownerInput, resetInput } from './s
 import { startImport, assertImporting, importChunk, commitImport, startInput, chunkInput, commitInput } from './import';
 import { SEGMENT_LINE_LIMIT } from '../../../packages/core/snapshot';
 
-const app = new Hono<{ Bindings: Bindings }>();
+// session is the id of the Owner's session on /admin/*.
+const app = new Hono<{ Bindings: Bindings; Variables: { session: string } }>();
 const jsonPolicy =
   "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 // A page of the management site loads its own script and stylesheet (and the browser its icon) and
@@ -82,6 +89,8 @@ app.use('*', async (c, next) => {
     'content-security-policy',
     c.res.headers.get('content-type')?.startsWith('text/html') ? pagePolicy : jsonPolicy,
   );
+  // The console's callback page has an authorization code in its address; the site's other files may be cached.
+  if (c.req.path.startsWith('/oauth/callback/')) c.header('cache-control', 'no-store');
 });
 // Nothing but /healthz runs under a root key the database does not recognize; see keyState.
 app.use('*', async (c, next) => {
@@ -91,18 +100,24 @@ app.use('*', async (c, next) => {
 app.use('/api/auth/*', bodyLimit({ maxSize: 1024 * 1024, onError: (c) => c.json({ error: 'body_too_large' }, 413) }));
 // New authorization, plaintext export, backup recipient changes and saving a connection need a
 // recent login. A connection decides which upstream receives which credential, and editing one keeps
-// its existing grants, so both forms reach the same credentials an export would. The full export is a
-// GET, since the browser downloads it through a link (and Hono answers HEAD with the GET handler).
+// its existing grants, so both forms reach the same credentials an export would. Authorizing one
+// decides which upstream account its credential acts as. The full export is a GET, since the browser
+// downloads it through a link (and Hono answers HEAD with the GET handler).
 const recentLoginRequired = (method: string, path: string) =>
   (['GET', 'HEAD'].includes(method) && path === '/admin/backup/export') ||
-  (method === 'POST' && (path === '/admin/grants' || /^\/admin\/access-requests\/[^/]+\/approve$/.test(path))) ||
+  (method === 'POST' &&
+    (path === '/admin/grants' ||
+      /^\/admin\/access-requests\/[^/]+\/approve$/.test(path) ||
+      /^\/admin\/connections\/[^/]+\/authorize$/.test(path))) ||
   (method === 'PUT' && path === '/admin/backup/config') ||
   (['POST', 'PUT'].includes(method) && /^\/admin\/connections(\/[^/]+)?$/.test(path));
 app.use('/admin/*', async (c, next) => {
   const write = !['GET', 'HEAD'].includes(c.req.method);
   if (write) requireOrigin(c.req.raw, c.env);
-  await requireOwner(c.req.raw, c.env, recentLoginRequired(c.req.method, c.req.path));
+  const owner = await requireOwner(c.req.raw, c.env, recentLoginRequired(c.req.method, c.req.path));
+  c.set('session', owner.session.id);
   await next();
+  for (const cookie of owner.headers.getSetCookie()) c.header('set-cookie', cookie, { append: true });
 });
 app.get('/healthz', async (c) => {
   const keys = await keyState(c.env);
@@ -279,12 +294,22 @@ app.get('/admin/status', async (c) => {
         ),
       })),
     ),
-    connections: connections.results,
+    // A connection the Owner authorizes comes with the callback to register upstream.
+    connections: (connections.results as { id: string; auth_json: string }[]).map((conn) =>
+      authorizes(JSON.parse(conn.auth_json) as Auth) ? { ...conn, callback: callbackUrl(c.env, conn.id) } : conn,
+    ),
     // An invocation to another origin than its connection's own comes with where that origin stands
     // under the connection as it is now: the extra host that covers it, if any, and whether the
-    // connection reaches any host. The card warns from this, never from anything the Agent wrote.
+    // connection reaches any host. The card warns from this, never from anything the Agent wrote. A
+    // setup comes with the callback of each connection it creates that the Owner authorizes, by id.
     pending: (pending.results as { requested_json: string }[]).map((request) => {
-      const call = (JSON.parse(request.requested_json) as StoredRequest).invocation;
+      const { invocation: call, setup, ids } = JSON.parse(request.requested_json) as StoredRequest;
+      if (setup) {
+        const callbacks = setup.connections.flatMap((draft, i) =>
+          authorizes(draft.auth) ? [[ids!.connectionIds[i], callbackUrl(c.env, ids!.connectionIds[i])]] : [],
+        );
+        return callbacks.length ? { ...request, callbacks: Object.fromEntries(callbacks) } : request;
+      }
       if (!call?.origin) return request;
       const policy = (connections.results as { id: string; policy_json: string }[]).find(
         (conn) => conn.id === call.connection,
@@ -405,14 +430,17 @@ app.put('/admin/secrets/:id', async (c) => {
   const old = await boundSecret(c.env, oid, sid);
   const merged = secretInput.shape.values.parse({ ...old.values, ...body.values });
   const envelope = await encryptSecret(rootKeys(c.env), { ownerId: oid, secretId: sid, version }, merged);
-  await c.env.DB.batch([
+  // A rotation of the refresh token in it may have written the next version since the read above.
+  const [inserted] = await c.env.DB.batch([
     c.env.DB.prepare(
-      'INSERT INTO secret_versions (id,secret_id,version,envelope_json,created_at) VALUES (?,?,?,?,?)',
-    ).bind(id(), sid, version, JSON.stringify(envelope), now()),
+      "INSERT INTO secret_versions (id,secret_id,version,envelope_json,created_at) SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM secrets WHERE id=? AND owner_id=? AND current_version=? AND status='active')",
+    ).bind(id(), sid, version, JSON.stringify(envelope), now(), sid, oid, body.expectedVersion),
     c.env.DB.prepare(
       "UPDATE secrets SET name=?,description=?,current_version=?,updated_at=? WHERE id=? AND owner_id=? AND current_version=? AND status='active'",
     ).bind(body.name, body.description, version, now(), sid, oid, body.expectedVersion),
   ]);
+  // secret_versions has a trigger, so its count is checked against 0.
+  assert(inserted.meta.changes > 0, 'version_conflict', 409);
   await audit(c.env, 'owner', 'secret:rotate', sid);
   return c.json({ id: sid, version });
 });
@@ -476,8 +504,15 @@ app.on(['POST', 'PUT'], '/admin/connections/:id?', async (c) => {
   const oid = await ownerId(c.env);
   const target = targetUrl(body.origin, '/', c.env.ALLOW_LOCAL_HTTP === 'true');
   const policy = policyJson(body, c.env.ALLOW_LOCAL_HTTP === 'true');
-  if (body.auth.type !== 'none')
-    validateAuthBinding(body.auth, (await boundSecret(c.env, oid, body.auth.secretId)).values);
+  body.auth = authEndpoints(body.auth, c.env.ALLOW_LOCAL_HTTP === 'true');
+  // A credential that signs or exchanges is tried before the connection is saved; what the try got is
+  // cached once it is.
+  let cache: D1PreparedStatement[] = [];
+  if (body.auth.type !== 'none') {
+    const secret = await boundSecret(c.env, oid, body.auth.secretId);
+    validateAuthBinding(body.auth, secret.values);
+    cache = await testCredential(c.env, oid, body.auth, secret);
+  }
   const cid = c.req.param('id') ?? id();
   if (c.req.method === 'PUT') {
     const bindingId = body.auth.type === 'none' ? null : body.auth.secretId;
@@ -503,6 +538,7 @@ app.on(['POST', 'PUT'], '/admin/connections/:id?', async (c) => {
     const result = await insertConnection(c.env, oid, cid, body, target.origin, policy).run();
     assert(result.meta.changes > 0, 'secret_not_found', 404);
   }
+  if (cache.length) await c.env.DB.batch(cache);
   await audit(c.env, 'owner', 'connection:save', cid);
   return c.json({ id: cid });
 });
@@ -517,6 +553,21 @@ app.delete('/admin/connections/:id', async (c) => {
   ]);
   await audit(c.env, 'owner', 'connection:delete', cid);
   return c.json({ ok: true });
+});
+// Authorizing a connection: the start answers the URL the console sends the browser to, and the
+// console's callback page completes it with what the upstream sent back. Only the session that started
+// an authorization completes it, so the completion needs no recent login of its own.
+app.post('/admin/connections/:id/authorize', async (c) =>
+  c.json(await startAuthorization(c.env, await ownerId(c.env), c.get('session'), resourceId.parse(c.req.param('id')))),
+);
+app.post('/admin/oauth/complete', async (c) => {
+  const warnings = await completeAuthorization(
+    c.env,
+    await ownerId(c.env),
+    c.get('session'),
+    completeInput.parse(await readJson(c.req.raw)),
+  );
+  return c.json({ ok: true, ...(warnings.length ? { warnings } : {}) });
 });
 // Order does not distinguish one field subset from another; absent means every field.
 const sameFields = (a: string[] | null | undefined, b: string[] | null | undefined) =>
@@ -642,7 +693,7 @@ app.post('/admin/access-requests/:id/:decision', async (c) => {
     approve && requested.grants
       ? z.object({ expiresAt: grantExpiry.default(() => now() + 86400000) }).parse(body).expiresAt
       : null;
-  const values = approve && requested.setup?.secret ? z.object({ values: valuesSchema }).parse(body).values : undefined;
+  const values = approve && requested.setup?.secret ? z.object({ values: setupValues }).parse(body).values : undefined;
   // The approval names the origin back, which shows that the Owner was told where the request goes:
   // an approval that names none may come from a client that presented it as a request to the
   // connection's own origin.
@@ -652,26 +703,36 @@ app.post('/admin/access-requests/:id/:decision', async (c) => {
     409,
     'This request goes to another origin than its connection’s own; the approval has to name that origin as stored. Reload the page and review the request again.',
   );
-  await decideRequest(c.env, oid, rid, row, approve, expiresAt, values);
-  return c.json({ ok: true });
+  const warnings = await decideRequest(c.env, oid, rid, row, approve, expiresAt, values);
+  return c.json({ ok: true, ...(warnings?.length ? { warnings } : {}) });
 });
+/** A connection of an approved setup whose credential failed its test after the approval: the error as
+ * the Owner's routes answer it. */
+type Warning = { connection: string; error: string; hint: string } & Record<string, unknown>;
 /** Approving a setup creates its credential from the values the Owner entered and every connection,
  * each bound to that credential, under the ids fixed on submission and checked as the Owner's own forms
  * check them. One batch holds them all, so a name taken since submission leaves nothing created. The
  * audit rows of the approval are in that batch under the same condition as the resources, so they are
- * written exactly when the resources are, however many connections there are. */
+ * written exactly when the resources are, however many connections there are.
+ * A credential that signs or exchanges is tried as the Owner's form tries it. One that never rewrites
+ * the secret is tried first and refuses the approval when it fails; a refresh token only once the batch
+ * stored the secret (settle), since the endpoint may rotate it, and a failure then is a warning. */
 async function setupStatements(
   env: Bindings,
   oid: string,
   rid: string,
   { setup, ids }: StoredRequest,
   values: Record<string, string> | undefined,
-) {
+): Promise<{ statements: D1PreparedStatement[]; settle: () => Promise<Warning[]> }> {
   const { secretId, connectionIds } = ids!;
   const { secret } = setup!;
-  const connections = setup!.connections.map((draft) =>
-    connectionInput.parse({ ...draft, auth: draft.auth.type === 'none' ? draft.auth : { ...draft.auth, secretId } }),
-  );
+  const connections = setup!.connections.map((draft) => {
+    const connection = connectionInput.parse({
+      ...draft,
+      auth: draft.auth.type === 'none' ? draft.auth : { ...draft.auth, secretId },
+    });
+    return { ...connection, auth: authEndpoints(connection.auth, env.ALLOW_LOCAL_HTTP === 'true') };
+  });
   const audited = (action: string, resource: string) =>
     auditStatement(env, 'owner', action, resource, { where: `WHERE ${pendingRequest}`, args: [rid, now()] });
   const writes = [
@@ -689,12 +750,20 @@ async function setupStatements(
     ...(await Promise.all(connectionIds.map((cid) => audited('connection:save', cid)))),
     await audited('access:approve', rid),
   ];
-  if (!secret) return writes;
+  if (!secret) return { statements: writes, settle: async () => [] };
+  // A field that only connections the Owner authorizes read, as their refresh token, may be left out:
+  // authorizing writes it.
+  const required = new Set(connections.flatMap(({ auth }) => (auth.type === 'none' ? [] : requiredFields(auth))));
+  const optional = secret.fields.filter(
+    (field) => !required.has(field) && connections.some(({ auth }) => authorizes(auth) && auth.refreshField === field),
+  );
   assert(
-    values && sameFields(Object.keys(values), secret.fields),
+    values &&
+      Object.keys(values).every((field) => secret.fields.includes(field)) &&
+      secret.fields.every((field) => optional.includes(field) || Object.hasOwn(values, field)),
     'secret_fields_mismatch',
     400,
-    `values holds exactly the fields ${secret.fields.join(', ')}`,
+    `values holds exactly the fields ${secret.fields.join(', ')}${optional.length ? `; ${optional.join(', ')} may be left out, since authorizing the connection writes it` : ''}`,
   );
   for (const connection of connections) validateAuthBinding(connection.auth, values);
   // Submission leaves credential names unchecked, since an installation may not learn names it cannot
@@ -705,17 +774,47 @@ async function setupStatements(
     409,
     'A credential with this name exists or existed, so this setup cannot be approved. Deny it and ask the Agent to submit again with another name.',
   );
-  return [
-    ...(await secretStatements(
-      env,
-      oid,
-      secretId!,
-      { name: secret.name, description: secret.description, values },
-      rid,
-    )),
-    await audited('secret:create', secretId!),
-    ...writes,
-  ];
+  // Connections configured alike are tried once.
+  const first = new Map<string, Exclude<(typeof connections)[number]['auth'], { type: 'none' }>>();
+  const refreshing: [string, string][] = [];
+  for (const [i, { auth }] of connections.entries()) {
+    if (auth.type === 'none') continue;
+    const key = exchanges(auth) ? await recipe(auth) : JSON.stringify(auth);
+    if (first.has(key)) continue;
+    first.set(key, auth);
+    if (auth.type === 'oauth-refresh') refreshing.push([connectionIds[i], key]);
+  }
+  const version = { version: 1, values };
+  const cache: D1PreparedStatement[] = [];
+  for (const auth of first.values())
+    if (auth.type !== 'oauth-refresh') cache.push(...(await testCredential(env, oid, auth, version)));
+  return {
+    statements: [
+      ...(await secretStatements(
+        env,
+        oid,
+        secretId!,
+        { name: secret.name, description: secret.description, values },
+        rid,
+      )),
+      await audited('secret:create', secretId!),
+      ...writes,
+    ],
+    // One waitUntil for all of it: each try may rotate a refresh token, and a client that disconnects
+    // would otherwise leave the tries after the current one unstarted.
+    settle: () =>
+      finish(
+        (async () => {
+          if (cache.length) await env.DB.batch(cache);
+          const warnings: Warning[] = [];
+          for (const [connection, key] of refreshing)
+            await testCredential(env, oid, first.get(key)!, version).catch((e: Fault) =>
+              warnings.push({ connection, error: e.code, hint: e.message, ...e.details }),
+            );
+          return warnings;
+        })(),
+      ),
+  };
 }
 /** Approving an update writes the scope and rules it proposes, as long as the connection is as it was
  * on submission: the Agent's tests and the Owner's comparison both read that state. The edit carries
@@ -751,7 +850,8 @@ async function updateStatements(env: Bindings, oid: string, rid: string, request
   ];
 }
 /** Applies a decision to a request read as pending. The request can expire after that read, so the
- * final UPDATE re-checks it and a decision that changed nothing fails without an audit row. */
+ * final UPDATE re-checks it and a decision that changed nothing fails without an audit row. An approved
+ * setup returns the warnings of its credential's tests. */
 export async function decideRequest(
   env: Bindings,
   oid: string,
@@ -763,10 +863,11 @@ export async function decideRequest(
 ) {
   const requested = JSON.parse(row.requested_json) as StoredRequest;
   const stamp = now();
+  const setup = approve && requested.setup ? await setupStatements(env, oid, rid, requested, values) : undefined;
   const statements = !approve
     ? []
-    : requested.setup
-      ? await setupStatements(env, oid, rid, requested, values)
+    : setup
+      ? setup.statements
       : requested.update
         ? await updateStatements(env, oid, rid, requested, stamp)
         : requested.grants
@@ -796,7 +897,7 @@ export async function decideRequest(
   assert(results[results.length - 1].meta.changes > 0, 'request_not_found', 404);
   // What an approval created or changed is audited as the Owner's own forms audit it; an approved
   // setup wrote its rows in the batch.
-  if (approve && requested.setup) return;
+  if (setup) return setup.settle();
   if (approve && requested.update) await audit(env, 'owner', 'connection:save', requested.update.connection);
   await audit(env, 'owner', `access:${approve ? 'approve' : 'deny'}`, rid);
 }
@@ -880,17 +981,24 @@ app.onError((e, c) => {
       : e instanceof z.ZodError
         ? { hint: issuesHint(e) }
         : {};
-  return new Response(JSON.stringify({ error: code, ...hint, request_id: c.res.headers.get('x-request-id') }), {
-    status,
-    headers: {
-      'content-type': 'application/json',
-      'cache-control': 'no-store',
-      ...(c.res.headers.get('www-authenticate') ? { 'www-authenticate': c.res.headers.get('www-authenticate')! } : {}),
+  const details = e instanceof Fault ? e.details : undefined;
+  return new Response(
+    JSON.stringify({ error: code, ...hint, ...details, request_id: c.res.headers.get('x-request-id') }),
+    {
+      status,
+      headers: {
+        'content-type': 'application/json',
+        'cache-control': 'no-store',
+        ...(c.res.headers.get('www-authenticate')
+          ? { 'www-authenticate': c.res.headers.get('www-authenticate')! }
+          : {}),
+      },
     },
-  });
+  );
 });
 export default {
-  fetch: (request: Request, env: Bindings, ctx: ExecutionContext) => app.fetch(request, env, ctx),
+  fetch: (request: Request, env: Bindings, ctx: ExecutionContext) =>
+    withContext(ctx, () => app.fetch(request, env, ctx)),
   scheduled: (event: ScheduledController, env: Bindings) =>
     withRequestId(String(event.scheduledTime), async () => {
       // An uninitialized instance has nothing to seal or back up, and a mismatched one must not be read or written.

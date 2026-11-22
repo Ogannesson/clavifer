@@ -74,6 +74,9 @@ const cleared = [
   'audit_events',
   'archive_segments',
   'import_chunks',
+  'token_cache',
+  'token_locks',
+  'oauth_flows',
   ...Object.values(authTables).map((table) => getTableName(table)),
 ];
 /** Empties the instance inside a batch that has spent an uninitialized instance's token, keeping only

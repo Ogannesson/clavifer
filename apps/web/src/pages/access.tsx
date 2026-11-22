@@ -1,4 +1,9 @@
-import { Fragment, useState, type ReactNode } from 'react';
+import { Fragment, useEffect, useState, type ReactNode } from 'react';
+import { authFields, authorizes, requiredFields, type Client, type Present } from '../../../../packages/core/auth';
+import { isRef, type Jwt } from '../../../../packages/core/jwt';
+import { FileButton, lockedKey, readText, ValueInput } from '../value-input';
+import { jsonFields } from '../values';
+import { AuthorizeButton } from './connections';
 import {
   api,
   clientName,
@@ -22,10 +27,24 @@ import {
   type PolicyTest,
   type RequestedGrant,
   type Setup,
+  type TokenEndpoint,
   type Update,
+  type Warning,
+  warningText,
 } from '../api';
 import { PageHead, RefreshButton, type AppApi } from '../shell';
-import { Badge, Drawer, EmptyState, Field, Icon, Loading, Panel, useConfirm } from '../ui';
+import {
+  Badge,
+  Drawer,
+  EmptyState,
+  EndpointAnswer,
+  EndpointRefusal,
+  Field,
+  Icon,
+  Loading,
+  Panel,
+  useConfirm,
+} from '../ui';
 
 /** A grant inside this window is close enough to expiry that the Owner may need to renew it. */
 export const EXPIRING_SOON = 2 * 3600 * 1000;
@@ -46,11 +65,30 @@ const durationOptions = DURATIONS.map(([value, label]) => (
 ));
 const expiresAtFor = (duration: string) => (Number(duration) ? Date.now() + Number(duration) : null);
 
+/** What a setup's approval left to do: the token endpoints' refusals, and the connections to authorize. */
+type Approved = { warnings: Warning[]; authorized: { id: string; name: string }[] };
+/** The token endpoint's refusal of a setup's last approval, which then created nothing. */
+type Refused = { message: string; endpoint: TokenEndpoint };
+// What each setup card shows of its last approval, by request id, with the request as last listed: a
+// card mounted again (on another page, or after a switch of pages) starts from it. An approval's result
+// stays, though no poll lists the request any more, until the Owner presses 完成; a refusal, until it
+// is closed or the request is no longer pending, since its form would act on a request that is gone.
+const held = new Map<string, { request: Pending; approved?: Approved; refused?: Refused }>();
+/** The requests that get a card: the pending ones, and those whose approval's result a card still shows. */
+export function pendingCards(pending: Pending[]) {
+  const listed = new Set(pending.map((p) => p.id));
+  // A refusal of a request no longer listed stays in held but gets no card; it is never listed again.
+  return [
+    ...pending,
+    ...[...held.values()].filter((h) => h.approved && !listed.has(h.request.id)).map((h) => h.request),
+  ];
+}
+
 /** Shown both on the overview and on this page: the same decision, wherever the Owner sees it. */
 export function PendingCard({ app, request }: { app: AppApi; request: Pending }) {
   const requested = parseRequested(request);
   return requested.setup ? (
-    <SetupCard app={app} request={request} setup={requested.setup} />
+    <SetupCard app={app} request={request} setup={requested.setup} ids={requested.ids} />
   ) : requested.update ? (
     <UpdateCard
       app={app}
@@ -259,11 +297,111 @@ function Visible({ text, lines = false }: { text: string; lines?: boolean }) {
   return <>{parts}</>;
 }
 
+const codes = (items: string[]) =>
+  items.map((item, i) => (
+    <Fragment key={item}>
+      {i ? '、' : ''}
+      <code>{item}</code>
+    </Fragment>
+  ));
+/** The fields of its secret a JWT carries in its header and claims, each once. */
+const carried = (jwt: Jwt) => [
+  ...new Set([...Object.values(jwt.header ?? {}), ...Object.values(jwt.claims)].filter(isRef).map((ref) => ref.$field)),
+];
+const signed = (jwt: Jwt, what: string) => {
+  const fields = carried(jwt);
+  return (
+    <>
+      用凭据字段 <code>{jwt.keyField}</code> 签{what}（{jwt.alg}）
+      {fields.length ? <>，其中带有字段 {codes(fields)} 的值</> : null}
+    </>
+  );
+};
+const presented = (p: Present, origin: ReactNode) =>
+  p.scheme === '' ? (
+    <>
+      作为请求头 <code>{p.header ?? 'Authorization'}</code>（不带前缀）发往 {origin}
+    </>
+  ) : (
+    <>
+      以{' '}
+      <code>
+        {p.header ?? 'Authorization'}: {p.scheme ?? 'Bearer'}
+      </code>{' '}
+      发往 {origin}
+    </>
+  );
+/** How a client proves itself to the token endpoint; null for a public client without an id. */
+const clientText = (client: Client) => {
+  const id = isRef(client.id) ? (
+    <>
+      字段 <code>{client.id.$field}</code> 里的客户端 ID
+    </>
+  ) : client.id ? (
+    <>
+      客户端 ID <code>{client.id}</code>
+    </>
+  ) : null;
+  switch (client.method) {
+    case 'basic':
+      return (
+        <>
+          以 Basic 认证带上{id}和字段 <code>{client.secretField}</code>
+        </>
+      );
+    case 'post':
+      return (
+        <>
+          在请求体里带上{id}和字段 <code>{client.secretField}</code>
+        </>
+      );
+    case 'jwt':
+      return (
+        <>
+          {id ? <>带上{id}，</> : null}
+          {signed(client.jwt, '一个客户端断言')}
+        </>
+      );
+    case 'none':
+      return id ? <>带上{id}</> : null;
+  }
+};
 /** Which credential fields go to an origin, and how, built from a connection's auth fields and never
- * from anything an Agent wrote. */
+ * from anything an Agent wrote. One that exchanges names its token endpoint, the credential's other
+ * destination. */
 function deliverySentence(auth: DraftAuth, url: string) {
   const origin = <code>{url}</code>;
+  const exchanged = (head: ReactNode, tokenUrl: string) => (
+    <>
+      {head}，发往 <code>{tokenUrl}</code> 换 access token，再{presented(auth as Present, origin)}
+    </>
+  );
   switch (auth.type) {
+    case 'jwt':
+      return (
+        <>
+          {signed(auth.jwt, '一个 JWT')}，每个请求现签，{presented(auth, origin)}
+        </>
+      );
+    case 'oauth-client':
+      return exchanged(clientText(auth.client), auth.tokenUrl);
+    case 'oauth-jwt':
+      return exchanged(
+        <>
+          {signed(auth.jwt, '一个 JWT 断言')}
+          {auth.client ? <>，并{clientText(auth.client)}</> : null}
+        </>,
+        auth.tokenUrl,
+      );
+    case 'oauth-refresh': {
+      const client = clientText(auth.client);
+      return exchanged(
+        <>
+          把字段 <code>{auth.refreshField}</code> 里的 refresh token{client ? <>，{client}</> : null}
+        </>,
+        auth.tokenUrl,
+      );
+    }
     case 'bearer':
       return (
         <>
@@ -483,14 +621,25 @@ const Lines = ({ items }: { items: string[] }) =>
  * which origin, and how. They are built from the draft's origin and auth fields and stand above the
  * reason in a framed block with code-set names, so nothing the Agent wrote can be read first or pass
  * for them. A connection that lists extra hosts adds where else its credential may go, one approved
- * request at a time. */
-function Delivery({ setup: { connections } }: { setup: Setup }) {
+ * request at a time; one the Owner authorizes, where the Owner will sign in and the callback the server
+ * fixed for it. */
+function Delivery({ setup: { connections }, callbacks }: { setup: Setup; callbacks: (string | undefined)[] }) {
   return (
     <div className="request-delivery">
       <span className="request-delivery-source">取自草案的服务地址和注入方式字段，不是 Agent 写的文字</span>
       {connections.map((c, i) => (
         <span key={i}>
           {deliverySentence(c.auth, c.origin)}
+          {authorizes(c.auth) ? (
+            <>
+              。批准后要到 <code>{new URL(c.auth.authorize.url).host}</code> 登录授权
+              {callbacks[i] ? (
+                <>
+                  ，先把回调地址 <code>{callbacks[i]}</code> 登记到上游
+                </>
+              ) : null}
+            </>
+          ) : null}
           {c.hosts?.length ? (
             <>
               ；经你逐次批准后，还可发往这些范围内的地址：
@@ -513,38 +662,137 @@ const freeText = '命中免审批规则的请求，任何安装实例不需授�
 
 /** An Agent's draft of a credential and the connections using it. The Owner enters the credential values
  * here, once for all of them, and approves or denies the draft as it stands; nothing on the card edits it. */
-function SetupCard({ app, request, setup }: { app: AppApi; request: Pending; setup: Setup }) {
+function SetupCard({
+  app,
+  request,
+  setup,
+  ids,
+}: {
+  app: AppApi;
+  request: Pending;
+  setup: Setup;
+  ids: { connectionIds: string[] };
+}) {
   const { secret, connections } = setup;
   const created = secret ? '凭据和连接' : '连接';
-  // A value goes only where a connection's auth names its field: the origins of those connections.
-  const originsOf = (field: string) => [
-    ...new Set(
-      connections
-        .filter(({ auth }) =>
-          auth.type === 'basic'
-            ? [auth.usernameField, auth.passwordField].includes(field)
-            : auth.type !== 'none' && auth.field === field,
-        )
-        .map((c) => c.origin),
-    ),
-  ];
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [approved, setApproved] = useState(() => held.get(request.id)?.approved ?? null);
+  const [refused, setRefused] = useState(() => held.get(request.id)?.refused ?? null);
+  useEffect(() => {
+    if (approved || refused) held.set(request.id, { request, ...(approved ? { approved } : { refused: refused! }) });
+    else held.delete(request.id);
+  }, [approved, refused, request]);
+  // A value goes only where a connection's auth names its field: the origin of a connection that sends
+  // it as it is or in a JWT, and the token endpoint of one that exchanges it, whose token then goes to
+  // its origin. A client id also goes to the authorization page the Owner is sent to.
+  const destinations = (field: string) => {
+    const sent = new Set<string>();
+    const tokens = new Set<string>();
+    for (const { auth, origin } of connections) {
+      if (auth.type === 'none' || !authFields(auth).includes(field)) continue;
+      if (!('tokenUrl' in auth)) {
+        sent.add(origin);
+        continue;
+      }
+      sent.add(new URL(auth.tokenUrl).origin);
+      if (authorizes(auth) && isRef(auth.client.id) && auth.client.id.$field === field)
+        sent.add(new URL(auth.authorize.url).origin);
+      tokens.add(origin);
+    }
+    return { sent: [...sent], tokens: [...tokens] };
+  };
+  // As the server decides it: a field only connections authorized in the console read, as their refresh
+  // token, may be left empty, since authorizing writes it.
+  const required = new Set(connections.flatMap(({ auth }) => (auth.type === 'none' ? [] : requiredFields(auth))));
+  const optional = (field: string) =>
+    !required.has(field) && connections.some(({ auth }) => authorizes(auth) && auth.refreshField === field);
+  // What is left to authorize once approved: the connections whose refresh token the Owner left empty.
+  const authorized = connections.flatMap((c, i) =>
+    authorizes(c.auth) && !values[c.auth.refreshField] ? [{ id: ids.connectionIds[i], name: c.name }] : [],
+  );
   const unused = '草案里没有连接使用这个字段，只保存';
   const deny = useDeny(app, request, secret ? '凭据和连接都不会创建，' : '连接不会创建，');
+  const done = `已批准，${created}已创建，Agent 查询这条申请的状态就能拿到连接 ID。要让它使用这些连接，还需另外给它授权（免审批规则内的请求不需要）。`;
+  if (approved)
+    return (
+      <div className={approved.warnings.length ? 'alert alert--warn' : 'alert alert--ok'}>
+        <span className="alert-icon">
+          <Icon name={approved.warnings.length ? 'alert' : 'check'} size={18} />
+        </span>
+        <div className="alert-body">
+          <strong>{done}</strong>
+          {approved.warnings.map((w) => (
+            <Fragment key={w.connection}>
+              <p>
+                连接「{connections[ids.connectionIds.indexOf(w.connection)]?.name ?? w.connection}」已创建，但换 token
+                失败：{warningText(w)}
+              </p>
+              {w.token_endpoint ? <EndpointAnswer endpoint={w.token_endpoint} /> : null}
+            </Fragment>
+          ))}
+          {approved.authorized.length ? (
+            <>
+              <p>这些连接要你到上游登录授权后才能使用：</p>
+              <ul className="request-grants">
+                {approved.authorized.map((c) => (
+                  <li key={c.id}>
+                    {c.name} <AuthorizeButton app={app} connection={c.id} label="去授权" />
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : null}
+          <div className="alert-actions">
+            <button
+              type="button"
+              className="btn btn--ghost btn--small"
+              onClick={() =>
+                void app.run(async () => {
+                  held.delete(request.id);
+                  await app.refresh();
+                }, '')
+              }
+            >
+              完成
+            </button>
+          </div>
+        </div>
+      </div>
+    );
   return (
     <PendingShell
       title={`${clientName(app.status, request.client_id)} 申请新建${created}`}
       request={request}
-      lead={<Delivery setup={setup} />}
+      lead={<Delivery setup={setup} callbacks={ids.connectionIds.map((id) => request.callbacks?.[id])} />}
     >
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          const f = new FormData(e.currentTarget);
-          const values = secret ? Object.fromEntries(secret.fields.map((field) => [field, fv(f, field)])) : null;
+          setRefused(null);
           void app.run(async () => {
-            await api(`/admin/access-requests/${request.id}/approve`, 'POST', values ? { values } : undefined);
-            await app.refresh();
-          }, `已批准，${created}已创建。Agent 查询申请状态即可拿到连接 ID；使用连接仍需授权，免审批规则内的请求除外。`);
+            const filled = secret ? secret.fields.filter((field) => values[field]) : [];
+            const locked = filled.filter((field) => lockedKey(values[field]));
+            if (locked.length) throw new Error(`字段 ${locked.join('、')} 还是带口令的私钥，请先输入口令解开。`);
+            let r;
+            try {
+              r = await api(
+                `/admin/access-requests/${request.id}/approve`,
+                'POST',
+                secret ? { values: Object.fromEntries(filled.map((field) => [field, values[field]])) } : undefined,
+              );
+            } catch (e) {
+              // Trying the credential failed at the token endpoint, so nothing was created; what it said
+              // stays on the card.
+              if (!(e instanceof Fault && e.endpoint)) throw e;
+              setRefused({ message: `${e.message}${created}都没有创建。`, endpoint: e.endpoint });
+              return;
+            }
+            const warnings = (r.warnings ?? []) as Warning[];
+            if (!warnings.length && !authorized.length) {
+              await app.refresh();
+              app.notify(done);
+            } else setApproved({ warnings, authorized });
+          }, '');
         }}
       >
         {secret ? (
@@ -553,31 +801,43 @@ function SetupCard({ app, request, setup }: { app: AppApi; request: Pending; set
             <dd>
               {secret.name}
               {secret.description ? <span className="muted"> · {secret.description}</span> : null}
+              <div className="alert-actions">
+                <FileButton
+                  label="从 JSON 文件填入"
+                  onFile={(file) =>
+                    void app.run(async () => {
+                      const { fields, notice } = await jsonFields(await readText(file), secret.fields);
+                      setValues((v) => ({ ...v, ...fields }));
+                      app.notify(notice);
+                    }, '')
+                  }
+                />
+              </div>
             </dd>
             {secret.fields.map((field) => {
-              const origins = originsOf(field);
+              const { sent, tokens } = destinations(field);
+              const where = sent.length
+                ? `将发往 ${sent.join('、')}${tokens.length ? `；换得的 token 发往 ${tokens.join('、')}` : ''}`
+                : unused;
               return (
                 <Fragment key={field}>
                   <dt className="mono">{field}</dt>
                   {/* Where the value goes stays in view where the Owner pastes it, every origin wrapped
                       whole: a cut one would show only the part an Agent can make look trustworthy. */}
                   <dd className="request-value">
-                    <input
+                    <ValueInput
                       name={field}
-                      type="password"
-                      autoComplete="off"
-                      required
-                      aria-label={`凭据字段 ${field} 的值，${origins.length ? `将发往 ${origins.join('、')}` : unused}`}
+                      value={values[field] ?? ''}
+                      onChange={(value) => setValues((v) => ({ ...v, [field]: value }))}
+                      required={!optional(field)}
+                      label={`凭据字段 ${field} 的值，${where}`}
                     />
                     <span className="small">
-                      {origins.length ? '将发往 ' : unused}
-                      {origins.map((origin, i) => (
-                        <Fragment key={origin}>
-                          {i ? '、' : ''}
-                          <code>{origin}</code>
-                        </Fragment>
-                      ))}
+                      {sent.length ? '将发往 ' : unused}
+                      {codes(sent)}
+                      {tokens.length ? <>；换得的 token 发往 {codes(tokens)}</> : null}
                     </span>
+                    {optional(field) ? <span className="small muted">可留空，批准后在连接上点授权获取</span> : null}
                   </dd>
                 </Fragment>
               );
@@ -627,6 +887,7 @@ function SetupCard({ app, request, setup }: { app: AppApi; request: Pending; set
           {connections.some((c) => c.free.length) ? `，但${freeText}${secret ? '，并会注入这份凭据' : ''}` : ''}
           。申请将在 {relativeText(request.expires_at)}失效。
         </p>
+        {refused ? <EndpointRefusal {...refused} onClose={() => setRefused(null)} /> : null}
         <div className="alert-actions">
           <button className="btn btn--small" disabled={app.busy}>
             批准并创建
@@ -761,7 +1022,8 @@ export function Access({ app }: { app: AppApi }) {
   const [open, setOpen] = useState(false);
   const [resource, setResource] = useState('');
   const confirm = useConfirm();
-  const { secrets, connections, clients, grants, pending } = app.status;
+  const { secrets, connections, clients, grants } = app.status;
+  const pending = pendingCards(app.status.pending);
   const activeClients = clients.filter((c) => !c.disabled && c.userId);
   const resources = [
     ...secrets.map((s) => ({ value: `secret:${s.id}`, label: `凭据 · ${s.name}` })),

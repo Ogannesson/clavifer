@@ -7,6 +7,8 @@ import {
   LINE_LIMIT,
   RECORD_TYPES,
   SEGMENT_LINE_LIMIT,
+  SNAPSHOT_FORMAT,
+  SNAPSHOT_FORMATS,
   SnapshotValidator,
   archiveHeader,
   checkReferences,
@@ -16,10 +18,12 @@ import {
   type RecordOf,
   type SnapshotRecord,
 } from '../packages/core/snapshot';
+import { JWT_ALGS, KEY_ENCODINGS } from '../packages/core/jwt';
+import { type Auth } from '../packages/core/auth';
 
-const header = (kind = 'full') => ({
+const header = (kind = 'full', format = 'clavifer-backup-v2') => ({
   type: 'header',
-  format: 'clavifer-backup-v1',
+  format,
   kind,
   createdAt: 1,
   source: { origin: 'https://vault.example.com', rpId: 'vault.example.com', version: '0.5.0' },
@@ -166,6 +170,67 @@ const counts = (over: Record<string, number> = {}) => ({
   ...over,
 });
 const end = (over: Record<string, number> = {}) => ({ type: 'end', counts: counts(over) });
+// An auth of every kind and form v2 adds to v1, reading the fields of `fields`.
+const ref = ($field: string) => ({ $field });
+const signed = {
+  alg: 'RS256',
+  keyField: 'key',
+  header: { kid: ref('kid'), typ: 'JWT' },
+  claims: { iss: ref('iss'), video: { room: 'r', join: true }, scope: ['a', 'b'], n: 1, none: null },
+  lifetime: 60,
+};
+const fields = { key: 'k', kid: 'i', iss: 's', id: 'c', secret: 'x', refresh: 'r' };
+const tokenUrl = 'https://auth.example.com/token';
+const derived = [
+  { type: 'jwt', secretId: 'secret', jwt: signed, scheme: '' },
+  {
+    type: 'jwt',
+    secretId: 'secret',
+    jwt: { alg: 'HS256', keyField: 'key', keyEncoding: 'hex', claims: {}, lifetime: 300, jti: true },
+    header: 'X-Token',
+    scheme: 'Ghost',
+  },
+  {
+    type: 'oauth-client',
+    secretId: 'secret',
+    client: { method: 'basic', id: ref('id'), secretField: 'secret' },
+    tokenUrl,
+  },
+  {
+    type: 'oauth-client',
+    secretId: 'secret',
+    client: { method: 'post', id: 'literal', secretField: 'secret' },
+    grantType: 'account_credentials',
+    scope: 'read',
+    tokenUrl,
+    bodyFormat: 'json',
+    params: { account_id: 'a' },
+    ttl: 60,
+    header: 'X-Shopify-Access-Token',
+    scheme: '',
+  },
+  { type: 'oauth-client', secretId: 'secret', client: { method: 'jwt', jwt: signed }, tokenUrl },
+  { type: 'oauth-jwt', secretId: 'secret', jwt: signed, tokenUrl },
+  {
+    type: 'oauth-jwt',
+    secretId: 'secret',
+    jwt: signed,
+    client: { method: 'post', id: ref('id'), secretField: 'secret' },
+    tokenUrl,
+    ttl: 3600,
+  },
+  { type: 'oauth-refresh', secretId: 'secret', refreshField: 'refresh', client: { method: 'none' }, tokenUrl },
+  {
+    type: 'oauth-refresh',
+    secretId: 'secret',
+    refreshField: 'refresh',
+    client: { method: 'jwt', id: 'client', jwt: signed },
+    scope: 'read',
+    authorize: { url: 'https://auth.example.com/authorize', scope: 'a b', params: { prompt: 'consent' } },
+    tokenUrl,
+  },
+] as const;
+const [jwtAuth, , , clientAuth, , assertionAuth, , publicRefresh, authorized] = derived;
 const complete = () => [
   header(),
   owner,
@@ -305,7 +370,9 @@ describe('snapshot records', () => {
     expect(accepts({ ...connection, auth: { ...connection.auth, value: 'x' } })).toBe(false);
     expect(accepts({ ...grant, extensions: [{ ...grant.extensions[0], note: '' }] })).toBe(false);
     expect(accepts({ ...segment(true), first: [1, 'a', 'b'] })).toBe(false);
-    expect(accepts({ ...header(), format: 'clavifer-backup-v2' })).toBe(false);
+    // The schema writers use is v2's alone.
+    expect(accepts(header('full', 'clavifer-backup-v1'))).toBe(false);
+    expect(accepts({ ...header(), format: 'clavifer-backup-v3' })).toBe(false);
   });
 
   it('tells null from a missing field', () => {
@@ -385,6 +452,135 @@ describe('snapshot records', () => {
       expect(accepts({ ...segment(false), key })).toBe(false);
     expect(accepts({ ...segment(false), seq: 9_999_999_999 })).toBe(true);
     expect(accepts({ ...segment(false), seq: 10_000_000_000 })).toBe(false);
+  });
+});
+
+describe('snapshot formats', () => {
+  const accepts = (record: unknown) => snapshotRecord.safeParse(record).success;
+  const v1 = (...records: unknown[]) => [header('full', 'clavifer-backup-v1'), ...records.slice(1)];
+  const withAuth = (auth: unknown) => complete().map((r) => (r === connection ? { ...connection, auth } : r));
+  const withRules = (rules: Record<string, string[]>) =>
+    complete().map((r) => (r === connection ? { ...connection, policy: { ...policy, ...rules } } : r));
+
+  it('writes v2 and reads v1 and v2, whose two lists are frozen', () => {
+    expect(SNAPSHOT_FORMAT).toBe('clavifer-backup-v2');
+    expect(SNAPSHOT_FORMATS).toEqual(['clavifer-backup-v1', 'clavifer-backup-v2']);
+    // What v2 takes as alg and keyEncoding; a longer list would be a new format.
+    expect(JWT_ALGS).toEqual([
+      'RS256',
+      'RS384',
+      'RS512',
+      'PS256',
+      'PS384',
+      'PS512',
+      'ES256',
+      'ES384',
+      'ES512',
+      'EdDSA',
+      'Ed25519',
+      'HS256',
+      'HS384',
+      'HS512',
+    ]);
+    expect(KEY_ENCODINGS).toEqual(['utf8', 'base64', 'base64url', 'hex']);
+    expect(() => validate(complete())).not.toThrow();
+    expect(() => validate(v1(...complete()))).not.toThrow();
+  });
+
+  it('names a format it does not know as one of a later version', () => {
+    for (const format of ['clavifer-backup-v3', 'something-else'])
+      expect(() => validate(complete().map((r, i) => (i ? r : { ...header(), format })))).toThrow(
+        expect.objectContaining({ code: 'snapshot_from_newer_version', status: 400 }),
+      );
+    // A header that names no format is malformed, and a file that opens with another record is out of order.
+    expect(() => validate([{ ...header(), format: 2 }, owner, settings, end()])).toThrow(
+      expect.objectContaining({ code: 'invalid_snapshot' }),
+    );
+    expect(() => validate([owner, header(), settings, end()])).toThrow('out of order');
+  });
+
+  it('carries every kind and form of authentication in v2 and only the five of v1 in v1', () => {
+    for (const auth of derived) {
+      expect(accepts({ ...connection, auth }), auth.type).toBe(true);
+      expect(() => validate(withAuth(auth))).not.toThrow();
+      expect(() => validate(v1(...withAuth(auth)))).toThrow(expect.objectContaining({ code: 'invalid_snapshot' }));
+    }
+    for (const auth of [connection.auth, { type: 'none' }]) expect(() => validate(v1(...withAuth(auth)))).not.toThrow();
+  });
+
+  it('holds the structure of the new kinds, not the business rules of a version', () => {
+    // A claim nested this many objects deep.
+    const nested = (depth: number): unknown => (depth ? { a: nested(depth - 1) } : 1);
+    const refused = [
+      // Deeper, reading it (its recipe, its row's JSON) would run out of stack.
+      { ...jwtAuth, jwt: { ...signed, claims: { deep: nested(33) } } },
+      { ...jwtAuth, jwt: { ...signed, claims: { iss: { $field: 'iss', x: 1 } } } },
+      { ...jwtAuth, jwt: { ...signed, extra: 1 } },
+      { ...jwtAuth, jwt: { ...signed, alg: 'none' } },
+      { ...jwtAuth, jwt: { ...signed, keyEncoding: 'latin1' } },
+      { ...jwtAuth, jwt: { ...signed, header: { kid: { $field: 'kid', x: 1 } } } },
+      { ...jwtAuth, jwt: { ...signed, header: { kid: 1 } } },
+      { ...jwtAuth, jwt: { ...signed, lifetime: 1.5 } },
+      { ...jwtAuth, jwt: { ...signed, keyField: '' } },
+      { ...jwtAuth, scheme: null },
+      { ...clientAuth, bodyFormat: 'xml' },
+      { ...clientAuth, ttl: 0 },
+      { ...clientAuth, params: { account_id: 1 } },
+      { ...clientAuth, client: { method: 'none' } },
+      { ...assertionAuth, client: { method: 'jwt', jwt: signed } },
+      { ...publicRefresh, client: { method: 'none', secretField: 'secret' } },
+      { ...authorized, authorize: { ...authorized.authorize, extra: 1 } },
+      { ...authorized, authorize: { scope: 'a' } },
+      (({ tokenUrl: _, ...rest }) => rest)(clientAuth),
+      (({ secretId: _, ...rest }) => rest)(assertionAuth),
+    ];
+    for (const auth of refused) expect(accepts({ ...connection, auth }), JSON.stringify(auth)).toBe(false);
+    // What a version requires when a connection is saved is not checked: a later one may relax it.
+    for (const auth of [
+      { ...jwtAuth, jwt: { ...signed, claims: { deep: nested(32) } } },
+      { ...jwtAuth, jwt: { ...signed, lifetime: 86_400 } },
+      { ...jwtAuth, jwt: { ...signed, alg: 'HS256' } },
+      { ...clientAuth, tokenUrl: 'not a URL' },
+    ])
+      expect(accepts({ ...connection, auth }), JSON.stringify(auth)).toBe(true);
+  });
+
+  it('refuses a v1 rule with a literal brace, which v2 reads as a wildcard', () => {
+    const braced: Record<string, string[]>[] = [
+      { deny: ['DELETE /v1/{id}'] },
+      { approval: ['/v1/a}'] },
+      { free: ['GET /v1/{'] },
+    ];
+    for (const rules of braced) {
+      expect(() => validate(v1(...withRules(rules)))).toThrow(
+        expect.objectContaining({ code: 'backup_has_unconvertible_rule', status: 409 }),
+      );
+      // In v2 a brace is the syntax, checked when a rule is matched, not here.
+      expect(() => validate(withRules(rules))).not.toThrow();
+    }
+    // Written encoded, a brace is literal in both formats; paths and hosts are no rules.
+    expect(() => validate(v1(...withRules({ deny: ['DELETE /v1/%7Bid%7D'], paths: ['/v1/{x}'] })))).not.toThrow();
+  });
+
+  it('refuses the same in a v1 draft the Owner may yet approve, whose tests ran under the literal reading', () => {
+    const tests = [{ method: 'GET', path: '/v1/x', expect: 'grant_required' }];
+    const update = (rule: string) => ({ update: { connection: 'connection', changes: { free: [rule] }, tests } });
+    const setup = (rule: string) => ({
+      setup: { connections: [{ name: 'A', paths: ['/v1'], approval: [rule], auth: { type: 'none' }, tests }] },
+      ids: { connectionIds: ['c1'] },
+    });
+    const pending = { ...request, expiresAt: Date.now() + 86_400_000 };
+    const withRequest = (over: object) => complete().map((r) => (r === request ? { ...pending, ...over } : r));
+    for (const draft of [update, setup]) {
+      expect(() => validate(v1(...withRequest({ requested: draft('GET /v1/{x}') })))).toThrow(
+        expect.objectContaining({ code: 'backup_has_unconvertible_rule', message: expect.stringContaining('request') }),
+      );
+      expect(() => validate(v1(...withRequest({ requested: draft('GET /v1/%7Bx%7D') })))).not.toThrow();
+      // Decided or expired, it is never approved; in v2 the brace is the syntax it was tested with.
+      for (const over of [{ status: 'denied' }, { status: 'approved' }, { expiresAt: Date.now() - 1 }])
+        expect(() => validate(v1(...withRequest({ requested: draft('GET /v1/{x}'), ...over })))).not.toThrow();
+      expect(() => validate(withRequest({ requested: draft('GET /v1/{x}') }))).not.toThrow();
+    }
   });
 });
 
@@ -486,6 +682,28 @@ describe('snapshot references', () => {
         { ...connection, status: 'deleted' },
       ]),
     ).not.toThrow();
+  });
+
+  it('requires every field an auth of the new kinds reads, but the refresh token it is yet to authorize', () => {
+    const bound = (auth: unknown, values: Record<string, string>) =>
+      check(
+        complete().map((r) =>
+          r === connection ? { ...connection, auth } : r === version ? { ...version, values } : r,
+        ),
+      );
+    const without = (field: string) => Object.fromEntries(Object.entries(fields).filter(([name]) => name !== field));
+    const broken = expect.objectContaining({ code: 'backup_has_broken_connection' });
+    for (const auth of derived) expect(bound(auth, fields), auth.type).not.toThrow();
+    // The key, a reference in the JWT header and one in its claims; the client's id and secret.
+    for (const field of ['key', 'kid', 'iss']) expect(bound(jwtAuth, without(field)), field).toThrow(broken);
+    expect(bound(derived[2], without('id'))).toThrow(broken);
+    expect(bound(derived[2], without('secret'))).toThrow(broken);
+    expect(bound(derived[6], without('secret'))).toThrow(broken);
+    // The client of a literal id reads no id.
+    expect(bound(clientAuth, without('id'))).not.toThrow();
+    expect(bound(publicRefresh, without('refresh'))).toThrow(broken);
+    expect(bound(authorized, without('refresh'))).not.toThrow();
+    expect(bound(authorized, without('key'))).toThrow(broken);
   });
 });
 
@@ -630,5 +848,77 @@ describe('v1 sample files', () => {
       expect(hash(PASSWORD, Buffer.from(salt, 'utf8'))).not.toBe(key);
       expect(hash(PASSWORD.normalize('NFKC'), Buffer.from(salt, 'hex'))).not.toBe(key);
     }
+  });
+});
+
+describe('v2 sample files', () => {
+  // Written by scripts/fixtures-v2.ts from one synthetic instance: frozen from the release that first
+  // writes v2 on.
+  async function sample(name: string, digest: string) {
+    const file = new Uint8Array(await readFile(`tests/fixtures/v2/${name}`));
+    expect(createHash('sha256').update(file).digest('hex'), name).toBe(digest);
+    const decrypter = new Decrypter();
+    decrypter.addIdentity((await readFile('tests/fixtures/v1/test-identity.txt', 'utf8')).trim());
+    const validator = new SnapshotValidator();
+    const records: SnapshotRecord[] = [];
+    for await (const value of readRecords(await decrypter.decrypt(chunks(file)))) records.push(validator.push(value));
+    validator.finish();
+    checkReferences(records);
+    const of = <T extends SnapshotRecord['type']>(type: T) => records.filter((r): r is RecordOf<T> => r.type === type);
+    return { records, of };
+  }
+  const automatic = () => sample('automatic-a.age', '4e5adefab32315f45188d981f4f2b0e0d657b6578875527bbd68cbe85dd571e8');
+  const full = () => sample('full-a.age', 'abb4b1bea2d675bf250d12dedd4d91963c0614e3e91909fb1916d382851657d3');
+
+  it('decrypt and validate as v2, the automatic backup and the full export of one instance', async () => {
+    const a = await automatic(),
+      f = await full();
+    expect(a.records[0]).toMatchObject({ type: 'header', format: 'clavifer-backup-v2', kind: 'automatic' });
+    expect(f.records[0]).toMatchObject({ type: 'header', format: 'clavifer-backup-v2', kind: 'full' });
+    for (const type of ['secret', 'secret-version', 'connection', 'archive-identity'] as const)
+      expect(f.of(type), type).toEqual(a.of(type));
+  });
+
+  it('hold every kind and form of authentication and rules of the new syntax', async () => {
+    const { of } = await automatic();
+    const auths = of('connection').map((c) => c.auth as Auth);
+    const kinds = <T extends Auth['type']>(type: T) =>
+      auths.filter((a): a is Extract<Auth, { type: T }> => a.type === type);
+    expect(new Set(auths.map((a) => a.type))).toEqual(
+      new Set(['none', 'bearer', 'header', 'basic', 'query', 'jwt', 'oauth-client', 'oauth-jwt', 'oauth-refresh']),
+    );
+    const jwts = [
+      ...kinds('jwt').map((a) => a.jwt),
+      ...kinds('oauth-jwt').map((a) => a.jwt),
+      ...auths.flatMap((a) => ('client' in a && a.client?.method === 'jwt' ? [a.client.jwt] : [])),
+    ];
+    expect(new Set(jwts.map((j) => j.alg))).toEqual(new Set(['RS256', 'ES256', 'HS256', 'PS256', 'RS512']));
+    expect(jwts.find((j) => j.alg === 'HS256')).toMatchObject({ keyEncoding: 'hex' });
+    expect(jwts.some((j) => j.jti)).toBe(true);
+    expect(jwts.some((j) => Object.values(j.claims).some((v) => Array.isArray(v)))).toBe(true);
+    expect(new Set(auths.flatMap((a) => ('client' in a && a.client ? [a.client.method] : [])))).toEqual(
+      new Set(['basic', 'post', 'jwt', 'none']),
+    );
+    expect(kinds('oauth-client').map((a) => a.grantType)).toContain('account_credentials');
+    expect(auths.filter((a) => 'bodyFormat' in a && a.bodyFormat === 'json').map((a) => a.type)).toEqual(
+      expect.arrayContaining(['oauth-client', 'oauth-refresh']),
+    );
+    expect(auths.some((a) => 'ttl' in a && a.ttl)).toBe(true);
+    expect(auths.some((a) => 'header' in a && typeof a.header === 'string')).toBe(true);
+    // Authorized, with the refresh token the endpoint rotated as its second version; and not yet.
+    const values = (secretId: string) =>
+      of('secret-version')
+        .filter((v) => v.secretId === secretId)
+        .map((v) => v.values);
+    const signIn = kinds('oauth-refresh').filter((a) => a.authorize);
+    expect(signIn.map((a) => values(a.secretId).map((v) => v[a.refreshField] ?? null))).toEqual(
+      expect.arrayContaining([['synthetic-refresh-1', 'synthetic-refresh-2'], [null]]),
+    );
+    const rules = of('connection').flatMap((c) => [...c.policy.deny, ...c.policy.approval, ...c.policy.free]);
+    for (const syntax of [/\{[a-z]+\}/, /\{\}/, /\/\*\*\//, /\/\*$/])
+      expect(
+        rules.some((rule) => syntax.test(rule)),
+        String(syntax),
+      ).toBe(true);
   });
 });

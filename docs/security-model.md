@@ -7,10 +7,10 @@ Clavifer has had no third-party security audit.
 ## What it protects
 
 - **Stored secret values.** Values are encrypted before they reach the database. The key that decrypts them is derived from a Worker secret and is not in the database. A copy of the database alone does not reveal a value.
-- **Credentials used through connections.** An installation that calls a connection never receives the credential. The server injects it into the outgoing request, removes any `Authorization` or `Cookie` header the caller sent, and returns only five response headers from the upstream.
-- **Where a credential can go.** A connection sends its credential to its own fixed origin. It reaches another origin only when the Owner listed that hostname or turned on any host, and then only for one request the Owner approved.
+- **Credentials used through connections.** An installation that calls a connection never receives the credential, nor a JWT or access token the server derives from it. The server injects it into the outgoing request, removes any `Authorization` or `Cookie` header the caller sent, and returns only five response headers from the upstream.
+- **Where a credential can go.** A connection sends its credential to its own fixed origin, and a connection that derives a token sends the client's credential to its token endpoint. Only the Owner sets either, in the console or by approving a setup draft. A credential reaches another origin only when the Owner listed that hostname or turned on any host, and then only for one request the Owner approved.
 - **What each installation can do.** An installation can use only what the Owner granted or approved. Revoking a grant or an installation takes effect on its next request.
-- **Sensitive Owner operations.** Granting access, approving requests, editing connections, downloading a full export, and changing the backup recipient need a sign-in within the last 10 minutes, so an older stolen session cannot perform them.
+- **Sensitive Owner operations.** Granting access, approving requests, editing connections, authorizing a connection at its upstream, downloading a full export, and changing the backup recipient need a sign-in within the last 10 minutes, so an older stolen session cannot perform them.
 
 ## What it does not protect
 
@@ -19,7 +19,7 @@ Clavifer has had no third-party security audit.
 - **What an allowed request does.** A grant lets an installation send any request inside the connection's regular scope that no deny rule or approval rule matches. Clavifer does not judge whether a request is what the user wanted.
 - **A compromised Owner.** Whoever holds the Owner's password or a Passkey, or controls the Owner's browser during a fresh session, has the Owner's full power.
 - **A compromised Cloudflare account.** Whoever controls the account controls the Worker and its secrets.
-- **A hostile upstream or hostile DNS.** The upstream receives the credential. The server trusts the hostname's resolution.
+- **A hostile upstream or hostile DNS.** The upstream and its token endpoint receive the credential. The server trusts the hostname's resolution.
 
 ## Trust boundaries
 
@@ -52,9 +52,9 @@ Clavifer runs on Cloudflare Workers with a D1 database and an R2 bucket. The Wor
 
 A connection's origin receives the credential on every request that runs. Its response body is passed back as it is. Point a connection only at a service whose operator you trust.
 
-The server accepts only public HTTPS hostnames as origins and extra hosts: no IP addresses, no single-label names, and no names ending in `localhost`, `local`, `internal`, `lan`, `home`, `test`, or `invalid`. It does not pin DNS and does not detect a public hostname that resolves to a private address.
+The server accepts only public HTTPS hostnames as origins, extra hosts, token endpoints, and authorization endpoints: no IP addresses, no single-label names, and no names ending in `localhost`, `local`, `internal`, `lan`, `home`, `test`, or `invalid`. It does not pin DNS and does not detect a public hostname that resolves to a private address.
 
-Source: `targetUrl()` and `validHost()` in `packages/core/proxy.ts`. Tests: `tests/security.test.ts`, `tests/policy.test.ts`.
+Source: `targetUrl()`, `endpointUrl()`, and `validHost()` in `packages/core/proxy.ts`. Tests: `tests/security.test.ts`, `tests/policy.test.ts`.
 
 ## How secrets are stored
 
@@ -76,15 +76,18 @@ Encryption of one version:
 
 The additional authenticated data binds an envelope to its owner, secret, and version. An envelope copied onto another secret or another version does not decrypt.
 
-Updating a secret writes a new version with a new data key under the current root key. Earlier versions stay in the database, encrypted, until the secret is deleted.
+Updating a secret writes a new version with a new data key under the current root key. Earlier versions stay in the database, encrypted, until the secret is deleted. A refresh token that a token endpoint rotates, or that an authorization brings, is written the same way, as a new version.
+
+A token the server derives from a secret at a token endpoint is cached in an envelope of the same kind. Its additional authenticated data is `["clavifer", 1, ownerId, "derived-token", secretId, recipe]`, where `recipe` is the SHA-256 of the configuration the token was obtained with, so a cached token opens only for the secret and the configuration it belongs to. A cached token that does not decrypt counts as absent.
 
 What is and is not encrypted:
 
 | Stored encrypted                                                                | Stored in the clear                                                               |
 | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
 | Field names and values of every secret version                                  | Secret names and descriptions                                                     |
-| The archive identity, in an envelope of the same kind                           | Connections: origin, policy, description, and which secret and fields they inject |
-| Sealed [segments](#cold-data) of old audit rows and access requests, in R2       | Grants, access requests with their full content, and the audit log                |
+| The archive identity, in an envelope of the same kind                           | Connections: origin, policy, description, token and authorization endpoints, and which secret and fields they use |
+| Cached tokens derived from secrets, until they expire                           | Grants, access requests with their full content, and the audit log                |
+| Sealed [segments](#cold-data) of old audit rows and access requests, in R2       | The digest of an authorization's `state`, with its session and connection, for 10 minutes |
 
 A pending or decided access request keeps the request an agent submitted, including the headers and body of an invocation. Do not put a secret into a request submitted for approval.
 
@@ -92,17 +95,17 @@ Deleting a secret removes the ciphertext of all its versions in the same databas
 
 ### The root key
 
-The service has one secret of its own, the Worker secret `ROOT_KEY`. It is a comma-separated ring of `<id>:<key>` entries, each key 32 bytes in base64url, the current key first; `parseRootKeys()` accepts nothing else. HKDF-SHA256 derives three keys from each root key, each for one use: the key-encryption key, the auth library's secret, and a fingerprint. The deploy entry `npm run deploy` generates the root key and hands it to wrangler without writing or printing it. A Worker secret cannot be read back once it is set.
+The service has one secret of its own, the Worker secret `ROOT_KEY`. It is a comma-separated ring of `<id>:<key>` entries, each key 32 bytes in base64url, the current key first; `parseRootKeys()` accepts nothing else. HKDF-SHA256 derives four keys from each root key, each for one use: the key-encryption key, the auth library's secret, a fingerprint, and the key that derives the PKCE verifier of an [authorization](#authorizing-a-connection). The deploy entry `npm run deploy` generates the root key and hands it to wrangler without writing or printing it. A Worker secret cannot be read back once it is set.
 
 Self-check. Creating the Owner, or completing an import, records the fingerprint of every key in the ring in the database. A Worker whose ring does not match them, because the key was replaced or the Worker is bound to another instance's database, answers `503 root_key_mismatch` on every route except `/healthz` and skips its scheduled work. It never writes data under a key the database does not know. On an initialized instance, a `ROOT_KEY` that cannot be parsed makes every route answer `503 invalid_root_key`, `/healthz` included. `/healthz` reports the state in `keys` and `initialized`, and `clavifer doctor` explains each state.
 
 Outside the Worker (and `.dev.vars` for a local trial), no copy of the root key exists, by design: nobody is asked to keep one, so there is none to leak. The cost is that a lost or overwritten key makes every stored secret undecryptable. Recovery goes through the automatic backup instead. `npm run deploy -- --rebuild` gives the Worker a new key and a new, empty database, and refuses unless `/healthz` reports the key lost or every database the Worker is bound to was deleted. The latest automatic backup is then [imported](#backups) into the new database; changes made after that backup are lost. Creating the Owner therefore requires a backup recipient, and the Owner keeps the matching age private key outside the service. [deploy.md](deploy.md) has the steps.
 
-Source: `packages/core/crypto.ts`; `rootKeys()` and `keyState()` in `apps/worker/src/context.ts`; the secret routes in `apps/worker/src/index.ts`; `scripts/deploy.mjs`. Tests: `tests/core.test.ts`, `tests/secrets.test.ts`, `tests/root-key-check.test.ts`, `tests/deploy.test.ts`.
+Source: `packages/core/crypto.ts`; `rootKeys()` and `keyState()` in `apps/worker/src/context.ts`; the secret routes in `apps/worker/src/index.ts`; the token cache in `apps/worker/src/token.ts`; `scripts/deploy.mjs`. Tests: `tests/core.test.ts`, `tests/secrets.test.ts`, `tests/token.test.ts`, `tests/root-key-check.test.ts`, `tests/deploy.test.ts`.
 
 ## Backups
 
-The automatic backup and the full export are the same snapshot of the instance. A snapshot is a file in the format `clavifer-backup-v1`, one JSON record per line, encrypted with [age](https://age-encryption.org) to a recipient, which is an age public key the Owner supplies. The server never holds the matching private key. The format is frozen: every later version reads it. The header comment of `packages/core/snapshot.ts` specifies it.
+The automatic backup and the full export are the same snapshot of the instance. A snapshot is a file in the format `clavifer-backup-v2`, one JSON record per line, encrypted with [age](https://age-encryption.org) to a recipient, which is an age public key the Owner supplies. The server never holds the matching private key. Each format is frozen once released, and every later version reads it: this version writes v2 and imports v1 and v2. v2 differs from v1 only in the four new kinds of `auth` and the new rule syntax. A v1 file whose rule holds a literal `{` or `}`, in a connection or in a pending draft, is refused (`backup_has_unconvertible_rule`), because that rule would mean something else in v2. The header comment of `packages/core/snapshot.ts` specifies both formats.
 
 Contents:
 
@@ -113,12 +116,13 @@ Contents:
 | Connections, installations with their client IDs, and grants       | OAuth consents and rate limit counters                  |
 | Access requests and the audit log, sealed segments included        | The bootstrap token                                     |
 | The backup recipient and the archive identity                      | Backup bookkeeping other than the recipient             |
+| Refresh tokens as they were at the snapshot, in the secret versions | Cached derived tokens and unfinished authorizations     |
 
 A snapshot is taken from one consistent read of the database and checked against the format and for the references an import needs. If the instance is inconsistent, the snapshot is refused whole and the console shows why; the last good backup stays.
 
 Three operations:
 
-- **Automatic backup.** Once the Owner has set a recipient, a scheduled run every 15 minutes writes a new file to the R2 bucket when the data a snapshot carries changed, when the recipient changed, or when the last successful backup is 24 hours old. Sign-ins and the service's own audit rows do not count as changes. It names each [sealed segment](#cold-data) by its key in the same bucket instead of copying it. The server keeps the newest file of each day for 30 days and the newest file of each month for the 12 months before that, and deletes the rest. It never deletes the latest backup. A failed cleanup is reported separately and does not mark the backup as failed. While the data outside sealed segments takes more than about 9 MB, the backup is skipped (`hot_data_over_limit`); the console warns before that.
+- **Automatic backup.** Once the Owner has set a recipient, a scheduled run every 15 minutes writes a new file to the R2 bucket when the data a snapshot carries changed, when the recipient changed, or when the last successful backup is 24 hours old. Sign-ins and the service's own audit rows do not count as changes; a refresh token the service rotates does, so the next run backs it up. It names each [sealed segment](#cold-data) by its key in the same bucket instead of copying it. The server keeps the newest file of each day for 30 days and the newest file of each month for the 12 months before that, and deletes the rest. It never deletes the latest backup. A failed cleanup is reported separately and does not mark the backup as failed. While the data outside sealed segments takes more than about 9 MB, the backup is skipped (`hot_data_over_limit`); the console warns before that.
 - **Full export.** The Owner gives a recipient and downloads the whole instance, with every sealed segment embedded. `GET /admin/backup/export` runs only when the browser reports `Sec-Fetch-Site: same-origin`, because the recipient is part of the link. A segment missing from the bucket, or without the checksum recorded when it was sealed, refuses the export before the first byte (`archive_segment_unavailable`). A download that breaks off can still end cleanly in the browser, so an export counts as whole only after the server wrote a `backup:export` audit row with the result `complete`. The console checks this with `GET /admin/backup/exports/{id}`.
 - **Import.** On the `/setup` page, an uninitialized instance can be initialized from a snapshot instead of creating a new Owner. This serves a migration to a new instance and a recovery after a lost root key alike. The Owner's browser decrypts the file locally with the age private key and sends the records over HTTPS in chunks; the private key is not sent. The server encrypts every secret version again under its own root key. Everything in the snapshot comes across, and installations keep their client IDs. Passkeys come across only when the new instance has the hostname of the old one. No token travels, so every installation logs in again. A segment that an automatic backup names must already be in the new instance's bucket with its checksum; the Owner can choose to go on without a missing one, and the import's audit row lists those skipped. The import checks structure and references only. The instance stays uninitialized, and nobody can sign in, until a final batch completes it.
 
@@ -126,7 +130,7 @@ The full export and changing the recipient need a recent sign-in. Changing the r
 
 The R2 bucket belongs to the same Cloudflare account as the Worker. Automatic backups are not an independent copy. Copy them elsewhere yourself.
 
-Source: `snapshot()` and `fullExport()` in `apps/worker/src/export.ts`; `apps/worker/src/backup.ts`; `apps/worker/src/import.ts`; `packages/core/snapshot.ts`; the importer in `apps/web/src/import.ts`. Tests: `tests/automatic-backup.test.ts`, `tests/full-export.test.ts`, `tests/import.test.ts`, `tests/snapshot.test.ts`, with the frozen samples in `tests/fixtures/v1/`.
+Source: `snapshot()` and `fullExport()` in `apps/worker/src/export.ts`; `apps/worker/src/backup.ts`; `apps/worker/src/import.ts`; `packages/core/snapshot.ts`; the importer in `apps/web/src/import.ts`. Tests: `tests/automatic-backup.test.ts`, `tests/full-export.test.ts`, `tests/import.test.ts`, `tests/snapshot.test.ts`, with the frozen samples in `tests/fixtures/v1/` and `tests/fixtures/v2/`.
 
 ## Audit log
 
@@ -139,7 +143,8 @@ The server writes a row to the `audit_events` table for each of the events below
 | `secret:read`                                                           | An installation reads a secret                                               | `authorized`                                         |
 | `access:approve`, `access:deny`                                         | The Owner decides an access request                                          | `ok`                                                 |
 | `grant:create`, `grant:revoke`                                          | The Owner creates or revokes a grant                                         | `ok`                                                 |
-| `secret:create`, `secret:rotate`, `secret:delete`                       | The Owner creates, updates, or deletes a secret                              | `ok`                                                 |
+| `secret:create`, `secret:rotate`, `secret:delete`                       | The Owner creates, updates, or deletes a secret. `secret:rotate` is also written by `system` when a token endpoint rotates a refresh token, and by `owner` when an authorization stores one | `ok`                                                 |
+| `token:exchange`                                                        | A request is sent to a token endpoint; a cached token writes nothing. The actor is the installation whose request needed the token, or `owner` for a try on save or approval and for an authorization; the resource is the secret's ID | `ok`, the endpoint's `error` code (`unrecognized` for one RFC 6749 does not define), `unavailable`, or a reason such as `no_expiry` |
 | `connection:save`, `connection:delete`                                  | The Owner creates, edits, or deletes a connection, also by approving a draft | `ok`                                                 |
 | `client:create`, `client:revoke`                                        | An installation is created or revoked                                        | `ok`                                                 |
 | `backup:export`                                                         | A full export starts, and again after its last byte; the resource is the export's ID | `started`, then `complete`; or an error code |
@@ -154,13 +159,14 @@ Not recorded:
 - The address a request to another origin went to. It is found through the `access:consume` row, which points to the access request that stores the whole approved request.
 - Requests the server refused, and access requests at the time they are submitted.
 - Owner sign-ins and device code approvals.
-- Any secret value.
+- The start of an authorization, which changes no credential. Its completion writes `token:exchange` and `secret:rotate` under one request ID.
+- Any secret value, any derived token, and the `error_description` a token endpoint returns.
 
 The web console shows the latest 50 rows. The server never deletes audit rows; old ones move to sealed segments, as the next section describes. The table is an ordinary table in the same database, and the segments are files in the same account's bucket, so neither is tamper-proof against someone with access to the account.
 
 When a request fails with an internal error, the Worker logs the error code and the request ID and nothing else.
 
-Source: `audit()` in `apps/worker/src/context.ts` and its callers in `apps/worker/src/index.ts`, `vault.ts`, `backup.ts`, `export.ts`, `archive.ts`, `setup.ts`, and `import.ts`. Tests: `tests/policy.test.ts`, `tests/proposals.test.ts`.
+Source: `audit()` in `apps/worker/src/context.ts` and its callers in `apps/worker/src/index.ts`, `vault.ts`, `token.ts`, `backup.ts`, `export.ts`, `archive.ts`, `setup.ts`, and `import.ts`. Tests: `tests/policy.test.ts`, `tests/proposals.test.ts`, `tests/token.test.ts`.
 
 ### Cold data
 
@@ -202,7 +208,7 @@ The console therefore runs only its own scripts and styles, nothing inline, and 
 Further rules:
 
 - A request that carries an `Origin` header different from the service's own origin is refused with `origin_not_allowed`. The OAuth token endpoint is the only exception. The Worker's own routes set no CORS headers.
-- JSON responses of the API, error responses, and responses relayed from an upstream carry `Cache-Control: no-store`.
+- JSON responses of the API, error responses, and responses relayed from an upstream carry `Cache-Control: no-store`. So does the console's callback page under `/oauth/callback/`, whose address carries an authorization code.
 - A `401` response carries a `WWW-Authenticate` header that points to the protected resource metadata.
 
 Source: the first middleware and `onError` in `apps/worker/src/index.ts`.
@@ -239,10 +245,10 @@ For a request to another origin that only any host covers, the console also asks
 ### Drafts
 
 - A setup draft cannot reference an existing secret, so an agent cannot route a stored credential to an origin it chose.
-- An update draft cannot change a connection's origin, injection, extra hosts, or any host setting.
+- An update draft cannot change a connection's origin, injection (token and authorization endpoints included), extra hosts, or any host setting.
 - A draft cannot turn on any host.
 - A draft's tests are decided by the same function as real requests, and a mismatch refuses the submission.
-- The review card states which field goes to which origin and how. That text is built from the draft's own `origin` and `auth` fields, not from anything the agent wrote, and stands above the agent's reason.
+- The review card states which field goes to which origin and how, including the host of a token endpoint the field is sent to and the host of an authorization endpoint the Owner will sign in at. That text is built from the draft's own `origin` and `auth` fields, not from anything the agent wrote, and stands above the agent's reason.
 - Submission does not reveal whether a secret name is taken, because an installation must not learn the names of secrets it cannot list.
 - Approval writes the secret, all connections, and the request's status in one batch. If one write fails, none takes effect.
 - An update is applied only if the connection is unchanged since submission (`connection_changed`).
@@ -250,6 +256,23 @@ For a request to another origin that only any host covers, the console also asks
 One request takes at most 256 KiB as stored, and one installation can hold at most 20 pending requests and 1 MiB of them, which bounds what the Owner has to read.
 
 Source: `requestFingerprint()`, `consumeApproval()`, `accessRequest()`, and `decide()` in `apps/worker/src/vault.ts`; `decideRequest()` and the approval route in `apps/worker/src/index.ts`; `canonicalPath()` in `packages/core/proxy.ts`; the review cards in `apps/web/src/pages/access.tsx`. Tests: `tests/policy.test.ts`, `tests/proposals.test.ts`.
+
+### Authorizing a connection
+
+An [authorization](connections.md#authorizing-a-connection) decides which upstream account a connection's credential acts as.
+
+| Property                             | Mechanism                                                                                                                                                                                  |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Only a recent Owner session starts it | Starting needs the Owner's session, the same origin, and a sign-in within the last 10 minutes.                                                                                            |
+| A forged callback does nothing       | `state` holds 32 random bytes, after the ID of the root key, and only the starting response carries it. The server stores its SHA-256 with the session and the connection, spends it in one statement, and accepts it for 10 minutes, from the same session only. |
+| A foreign code does not work         | Every authorization carries a PKCE challenge (RFC 7636, `S256`). The verifier is derived from `state` with a key derived from the root key and is never stored; a code issued for another challenge fails at the token endpoint. |
+| A code goes to its own token endpoint | Each connection has its own callback address, so a code that one authorization server issued cannot be completed against another connection's token endpoint (RFC 9700 §4.4.2). The server does not check the `iss` parameter. |
+| The configuration cannot change midway | Completion requires the connection's `auth` to be what it was at the start (`connection_changed`).                                                                                       |
+| The code does not leak from the page | The callback page removes the code from the address bar, is not cached, and sends no `Referer`.                                                                                          |
+
+Completing an authorization needs the Owner's session and the same origin, but no new recent sign-in: the session that started it had one, and signing in at the upstream may take minutes.
+
+Source: `startAuthorization()` and `completeAuthorization()` in `apps/worker/src/token.ts`; `pkceVerifier()` in `packages/core/crypto.ts`. Tests: `tests/authorize.test.ts`.
 
 ## Known limits and non-goals
 
@@ -271,5 +294,11 @@ These are properties of the design or gaps the project has not closed. They are 
 - **No account recovery by email.** Recovering a lost password and Passkeys takes a token that only the deployment can issue.
 - **Revocation cannot recall a request** that was already sent to an upstream.
 - **The REST proxy does not limit response size.** It streams until the upstream ends or 20 seconds pass.
+- **A token endpoint is a second destination of the credential.** A connection of type `oauth-client`, `oauth-jwt`, or `oauth-refresh` sends a client secret, a signed assertion, or a refresh token to its `tokenUrl`, which usually has another hostname than `origin`. The authorization endpoint of `authorize` is where the Owner's browser signs in, so a hostile one could imitate a sign-in page. Both are checked like an origin, only the Owner sets them, and the review card of a draft shows their hosts, but nothing restricts them to the upstream's own domain.
+- **Cached tokens are in the database.** A token derived from a secret stays in the database, encrypted under the root key, until it expires; the cache key is a digest of the configuration. Whoever can decrypt secrets can decrypt the cached tokens as well.
+- **Path rules do not see operations in the body.** A batch endpoint, an RPC endpoint, a SQL query, or a form field such as `_method` in the body can carry an operation that no rule on the path can name. Deny or approve such endpoints as a whole.
+- **A restored refresh token may be invalid.** A backup holds each refresh token as it was when the backup was taken. If the token endpoint rotated it since, the restored one no longer works, and the Owner authorizes the connection again.
+- **Rotations on approval share 30 seconds.** Approving a setup with several `oauth-refresh` connections tries their refresh tokens one after the other. If the Owner's browser disconnects, the Worker keeps running for at most 30 seconds, and a rotated refresh token that was not written by then is lost.
+- **The list of method-rewriting query parameters is partly unverified.** Only `$httpMethod` was observed to rewrite the method, on Google APIs. `_method`, `_HttpMethod`, and `$httpHeaders` are refused because frameworks and APIs commonly use them, without a test against a real upstream.
 
 To report a vulnerability, see [SECURITY.md](../SECURITY.md).

@@ -339,7 +339,8 @@ describe('setup approval', () => {
     for (const [values, code] of [
       [{ token: 'a', extra: 'b' }, 'secret_fields_mismatch'],
       [{ other: 'a' }, 'secret_fields_mismatch'],
-      [{}, 'invalid_input'],
+      // No values pass the schema, for a setup whose every field authorizing writes, but not this one.
+      [{}, 'secret_fields_mismatch'],
       [{ token: ' padded ' }, 'invalid_header_credential'],
       [{ token: 'x'.repeat(16385) }, 'invalid_input'],
     ] as const)
@@ -505,6 +506,154 @@ describe('setup approval', () => {
     for (const cid of ids.connectionIds)
       expect(await env.DB.prepare('SELECT 1 FROM connections WHERE id=?').bind(cid).first()).toBeNull();
     expect(await env.DB.prepare('SELECT 1 FROM secrets WHERE id=?').bind(ids.secretId).first()).toBeNull();
+  });
+});
+
+describe('a setup whose connection exchanges a token', () => {
+  const tokenUrl = 'https://auth.vendor.example/oauth/token';
+  // The vendor's token endpoint answers by host; the API answers "ok" as everywhere in this file.
+  let answer: (body: URLSearchParams) => Response = () =>
+    Response.json({ access_token: 'AT-vendor', expires_in: 3600 });
+  const tokens: URLSearchParams[] = [];
+  beforeEach(() => {
+    tokens.length = 0;
+    answer = () => Response.json({ access_token: 'AT-vendor', expires_in: 3600 });
+    upstream.mockImplementation(async (url, init) => {
+      if (!String(url).startsWith('https://auth.vendor.example/')) return new Response('ok');
+      const body = new URLSearchParams(String(init!.body));
+      tokens.push(body);
+      return answer(body);
+    });
+  });
+  afterAll(() => upstream.mockImplementation(async () => new Response('ok')));
+  const tokenDraft = (auth: object, fields = ['client_id', 'client_secret']) => {
+    const d = draft();
+    return { ...d, secret: { ...d.secret, fields }, connections: [{ ...d.connections[0], auth }] };
+  };
+  const client = {
+    type: 'oauth-client',
+    client: { method: 'post', id: { $field: 'client_id' }, secretField: 'client_secret' },
+    tokenUrl,
+  };
+  const refresh = {
+    type: 'oauth-refresh',
+    refreshField: 'refresh_token',
+    client: { method: 'post', id: { $field: 'client_id' }, secretField: 'client_secret' },
+    tokenUrl,
+  };
+
+  it('takes the new kinds as strict objects whose every field is listed, with the token endpoint checked', async () => {
+    const rid = await submit({ setup: tokenDraft({ ...client, tokenUrl: 'https://AUTH.vendor.example/oauth/token' }) });
+    expect((await stored(rid)).setup.connections[0].auth.tokenUrl).toBe(tokenUrl);
+    expect(await hint({ setup: tokenDraft({ ...client, client: { ...client.client, secretField: 'other' } }) })).toBe(
+      'requested.setup.connections.0.auth: every field auth names must be listed in secret.fields',
+    );
+    const jwt = { alg: 'RS256', keyField: 'client_secret', claims: { sub: { $field: 'unlisted' } }, lifetime: 60 };
+    expect(await hint({ setup: tokenDraft({ type: 'oauth-jwt', jwt, tokenUrl }) })).toBe(
+      'requested.setup.connections.0.auth: every field auth names must be listed in secret.fields',
+    );
+    expect(await hint({ setup: tokenDraft({ ...client, client: { ...client.client, extra: 1 } }) })).toContain(
+      'Unrecognized key: "extra"',
+    );
+    await expect(
+      submit({ setup: tokenDraft({ ...client, tokenUrl: 'https://auth.vendor.example/token?tenant=a' }) }),
+    ).rejects.toMatchObject({
+      code: 'endpoint_must_not_contain_query',
+      message: expect.stringMatching(/^connections\.0 "Vendor \d+": auth\.tokenUrl$/),
+    });
+    expect(tokens).toHaveLength(0);
+  });
+
+  it('refuses an extra parameter whose value starts or ends with whitespace, as the Owner’s form does', async () => {
+    const spaced = { ...client, params: { audience: ' https://api.vendor.example/' } };
+    expect(await hint({ setup: tokenDraft(spaced) })).toBe(
+      'requested.setup.connections.0.auth.params.audience: a value cannot start or end with whitespace',
+    );
+    const authorize = { url: 'https://auth.vendor.example/authorize', params: { prompt: 'consent\n' } };
+    expect(
+      await hint({ setup: tokenDraft({ ...refresh, authorize }, ['client_id', 'client_secret', 'refresh_token']) }),
+    ).toBe('requested.setup.connections.0.auth.authorize.params.prompt: a value cannot start or end with whitespace');
+    const saved = await call('/admin/connections', 'POST', {
+      name: `Spaced ${++serial}`,
+      origin: 'https://api.vendor.example',
+      paths: ['/v1'],
+      auth: { ...spaced, secretId: crypto.randomUUID() },
+    });
+    expect(saved).toMatchObject({
+      status: 400,
+      body: { error: 'invalid_input', hint: 'auth.params.audience: a value cannot start or end with whitespace' },
+    });
+    expect(tokens).toHaveLength(0);
+  });
+
+  it('tries a token that never rewrites the secret before approving, and approves nothing when it fails', async () => {
+    const rid = await submit({ setup: tokenDraft(client) });
+    const { ids } = await stored(rid);
+    const before = [await count('secrets'), await count('connections')];
+    answer = () => Response.json({ error: 'invalid_client', error_description: 'Unknown client' }, { status: 401 });
+    expect(
+      await call(`/admin/access-requests/${rid}/approve`, 'POST', {
+        values: { client_id: 'id-1', client_secret: 's-1' },
+      }),
+    ).toMatchObject({
+      status: 502,
+      body: {
+        error: 'token_exchange_failed',
+        token_endpoint: { status: 401, error: 'invalid_client', error_description: 'Unknown client' },
+      },
+    });
+    expect([await count('secrets'), await count('connections')]).toEqual(before);
+    expect(await requestStatus(rid)).toBe('pending');
+    answer = () => Response.json({ access_token: 'AT-vendor', expires_in: 3600 });
+    expect(
+      await call(`/admin/access-requests/${rid}/approve`, 'POST', {
+        values: { client_id: 'id-1', client_secret: 's-1' },
+      }),
+    ).toEqual({ status: 200, body: { ok: true } });
+    expect(tokens.map((t) => t.get('client_secret'))).toEqual(['s-1', 's-1']);
+    // The token of the test is cached for the first version once the batch stored it.
+    expect(
+      await env.DB.prepare('SELECT version FROM token_cache WHERE secret_id=?').bind(ids.secretId).first(),
+    ).toEqual({ version: 1 });
+    expect(await send(ids.connectionIds[0], 'GET', '/v1/status')).toBe('run');
+    expect(tokens).toHaveLength(2);
+  });
+
+  it('stores a refresh token before trying it, and approves with a warning when the try fails', async () => {
+    const fields = ['client_id', 'client_secret', 'refresh_token'];
+    const values = { client_id: 'id-2', client_secret: 's-2', refresh_token: 'RT-1' };
+    answer = () => Response.json({ access_token: 'AT-vendor', expires_in: 3600, refresh_token: 'RT-2' });
+    const rid = await submit({ setup: tokenDraft(refresh, fields) });
+    const { ids } = await stored(rid);
+    expect(await call(`/admin/access-requests/${rid}/approve`, 'POST', { values })).toEqual({
+      status: 200,
+      body: { ok: true },
+    });
+    expect(tokens.map((t) => t.get('refresh_token'))).toEqual(['RT-1']);
+    // The rotation the try caused is the credential's second version.
+    expect(await boundSecret(env, agent.userId, ids.secretId)).toEqual({
+      version: 2,
+      values: { ...values, refresh_token: 'RT-2' },
+    });
+
+    answer = () => Response.json({ error: 'invalid_grant', error_description: 'Token revoked' }, { status: 400 });
+    const failing = await submit({ setup: tokenDraft(refresh, fields) });
+    const created = await stored(failing);
+    expect(await call(`/admin/access-requests/${failing}/approve`, 'POST', { values })).toMatchObject({
+      status: 200,
+      body: {
+        ok: true,
+        warnings: [
+          {
+            connection: created.ids.connectionIds[0],
+            error: 'token_exchange_failed',
+            token_endpoint: { status: 400, error: 'invalid_grant', error_description: 'Token revoked' },
+          },
+        ],
+      },
+    });
+    expect(await requestStatus(failing)).toBe('approved');
+    expect((await boundSecret(env, agent.userId, created.ids.secretId)).version).toBe(1);
   });
 });
 
@@ -874,6 +1023,10 @@ describe('the pending requests of one installation', () => {
     expect((refused as Error).message).toContain('as stored');
     // 90 tests of 1000 Chinese characters: about 276 KB in about 92,000 characters.
     await expect(propose(p, padded(90, { char: '中' }))).rejects.toMatchObject({ code: 'request_too_large' });
+    // The size is checked before any test runs, so a test that fails changes nothing.
+    const failing = padded(90, { char: '中' });
+    failing.connections[2].tests.push({ ...out('/v2/x'), expect: 'run' });
+    await expect(propose(p, failing)).rejects.toMatchObject({ code: 'request_too_large' });
     expect(await pending(p)).toEqual([]);
     // 43,000 control characters store as about 258 KB; 80 Chinese tests as about 249 KB.
     const ids = [(await send(p, 43000)).id, (await propose(p, padded(80, { char: '中' }))).id];

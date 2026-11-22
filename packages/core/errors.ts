@@ -3,6 +3,8 @@ export class Fault extends Error {
     public code: string,
     public status = 400,
     message = code,
+    // Further members of the error response, for the Owner's routes only (see ownerFault in token.ts).
+    public details?: Record<string, unknown>,
   ) {
     super(message);
   }

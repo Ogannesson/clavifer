@@ -2,19 +2,42 @@ import { useState } from 'react';
 import { api, fv, timeText, type Secret } from '../api';
 import { PageHead, RefreshButton, type AppApi } from '../shell';
 import { Badge, Drawer, EmptyState, Field, Icon, Loading, Panel, useConfirm } from '../ui';
+import { FileButton, lockedKey, readText, ValueInput } from '../value-input';
+import { jsonFields } from '../values';
 
 type Editing = { secret: Secret | null } | null;
+/** One field of the form; key stays with the row while its name and value change. */
+type Row = { key: number; field: string; value: string };
 
 export function Secrets({ app }: { app: AppApi }) {
   const [editing, setEditing] = useState<Editing>(null);
-  const [rows, setRows] = useState<number[]>([0]);
+  const [rows, setRows] = useState<Row[]>([]);
   const confirm = useConfirm();
   const secret = editing?.secret ?? null;
 
   const openEditor = (target: Secret | null) => {
-    setRows([0]);
+    setRows([{ key: 0, field: target ? '' : 'token', value: '' }]);
     setEditing({ secret: target });
   };
+  const update = (key: number, change: Partial<Row>) =>
+    setRows((list) => list.map((r) => (r.key === key ? { ...r, ...change } : r)));
+  // A JSON file sets the value of a row of the same name and adds a row for every other name; a row
+  // without a value (the blank one the form opens with) gives way to them.
+  const fill = (file: File) =>
+    void app.run(async () => {
+      const { fields, notice } = await jsonFields(await readText(file));
+      setRows((list) => {
+        const kept = list
+          .filter((r) => r.value || Object.hasOwn(fields, r.field))
+          .map((r) => (Object.hasOwn(fields, r.field) ? { ...r, value: fields[r.field] } : r));
+        let next = Math.max(0, ...list.map((r) => r.key)) + 1;
+        const added = Object.entries(fields)
+          .filter(([name]) => !kept.some((r) => r.field === name))
+          .map(([field, value]) => ({ key: next++, field, value }));
+        return [...kept, ...added];
+      });
+      app.notify(notice);
+    }, '');
 
   const remove = async (s: Secret) => {
     const ok = await confirm({
@@ -115,9 +138,11 @@ export function Secrets({ app }: { app: AppApi }) {
             const f = new FormData(e.currentTarget);
             void app.run(
               async () => {
-                const names = f.getAll('field').map((v) => String(v).trim());
+                const names = rows.map((r) => r.field.trim());
                 if (new Set(names).size !== names.length) throw new Error('字段名称不能重复。');
-                const values = Object.fromEntries(names.map((name, i) => [name, String(f.getAll('value')[i] ?? '')]));
+                const locked = rows.filter((r) => lockedKey(r.value)).map((r) => r.field);
+                if (locked.length) throw new Error(`字段 ${locked.join('、')} 还是带口令的私钥，请先输入口令解开。`);
+                const values = Object.fromEntries(rows.map((r, i) => [names[i], r.value]));
                 await api(secret ? '/admin/secrets/' + secret.id : '/admin/secrets', secret ? 'PUT' : 'POST', {
                   name: fv(f, 'name').trim(),
                   description: fv(f, 'description'),
@@ -140,38 +165,52 @@ export function Secrets({ app }: { app: AppApi }) {
           <fieldset>
             <legend>字段</legend>
             {rows.map((row, index) => (
-              <div className="field-row" key={row}>
+              <div className="field-row" key={row.key}>
                 <Field label="字段名称">
                   <input
                     name="field"
                     required
                     list="secret-fields"
                     pattern="[A-Za-z_][A-Za-z0-9_\-]*"
-                    defaultValue={index === 0 && !secret ? 'token' : ''}
+                    value={row.field}
+                    onChange={(e) => update(row.key, { field: e.target.value })}
                   />
                 </Field>
                 <Field label="凭据值">
-                  <input name="value" type="password" autoComplete="off" required />
+                  <ValueInput
+                    name="value"
+                    label={`字段 ${row.field || index + 1} 的值`}
+                    value={row.value}
+                    onChange={(value) => update(row.key, { value })}
+                  />
                 </Field>
-                {index === 0 ? null : (
+                {rows.length === 1 ? null : (
                   <button
                     type="button"
                     className="btn btn--quiet"
-                    onClick={() => setRows((list) => list.filter((r) => r !== row))}
+                    onClick={() => setRows((list) => list.filter((r) => r.key !== row.key))}
                   >
                     移除
                   </button>
                 )}
               </div>
             ))}
-            <button
-              type="button"
-              className="btn btn--ghost btn--small"
-              onClick={() => setRows((list) => [...list, (list.at(-1) ?? 0) + 1])}
-            >
-              <Icon name="plus" size={15} />
-              增加字段
-            </button>
+            <div className="form-actions">
+              <button
+                type="button"
+                className="btn btn--ghost btn--small"
+                onClick={() =>
+                  setRows((list) => [
+                    ...list,
+                    { key: Math.max(0, ...list.map((r) => r.key)) + 1, field: '', value: '' },
+                  ])
+                }
+              >
+                <Icon name="plus" size={15} />
+                增加字段
+              </button>
+              <FileButton label="从 JSON 文件填入" onFile={fill} />
+            </div>
             <datalist id="secret-fields">
               {secret?.fields.map((name) => (
                 <option key={name} value={name} />
@@ -179,7 +218,8 @@ export function Secrets({ app }: { app: AppApi }) {
             </datalist>
             <p className="field-hint">
               {secret ? `现有字段：${secret.fields.join('、')}；填新字段名会新增该字段。` : ''}
-              最多 20 个字段，字段名以字母或下划线开头。
+              最多 20 个字段，字段名以字母或下划线开头。多行的值（如 PEM 私钥）直接粘贴、从文件读取或拖进值框；从 JSON
+              文件填入会把每个字符串值填成一个字段，字段名取最内层的键名。
             </p>
           </fieldset>
           <div className="form-actions">

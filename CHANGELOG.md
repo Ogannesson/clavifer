@@ -4,6 +4,35 @@ All notable changes to this project are recorded in this file. The format follow
 
 When upgrading to a version takes an extra step, that version's entry lists the step under `### Upgrade notes`.
 
+## [0.6.0] - Unreleased
+
+### Added
+
+- Four ways for a connection to derive its credential from the stored secret on the server. `jwt` signs a JWT for every request. `oauth-client`, `oauth-jwt` and `oauth-refresh` get an access token from a token endpoint for client credentials, a JWT bearer assertion or a refresh token, cache it encrypted until shortly before it expires, and write a refresh token the endpoint rotates as a new version of the secret. JWTs are signed with RSA, RSA-PSS, ECDSA, Ed25519 or HMAC keys; private keys are read as PKCS#8, PKCS#1, SEC1 or JWK, and the console decrypts an encrypted PKCS#8 key in the browser. Saving a connection, or approving a draft, tries the credential first; when a key cannot be read, the console names its field and the reason. A private key pasted as one line with `\n` escapes, as it is copied out of a JSON key file, is turned back into lines.
+- Authorizing a connection from the console with the OAuth authorization code flow and PKCE. The Owner saves the connection or approves its draft first, then authorizes; the refresh token the upstream issues is written into the secret. Each connection has its own callback address.
+- The console reads the state again every 15 seconds while its tab is in view, and when the tab comes back into view, so new access requests appear without a refresh. It also says when a newer console has been deployed and offers to reload.
+- Rule paths: `{name}` matches one segment, with literal text around it if needed, and `**` matches any number of segments. Rules read a path containing `%2F` both decoded and with each `%2F` kept inside its segment.
+
+### Changed
+
+- `{` and `}` in a rule path are wildcards; they were literal characters before.
+- Snapshots are written in the format `clavifer-backup-v2`. An import reads `clavifer-backup-v1` files as well.
+- Getting a token and calling the upstream have 20 seconds each.
+- The `clavifer` command waits up to 45 seconds for an answer from the server, up from 30.
+
+### Fixed
+
+- An admin request that extends the Owner's session passes the renewed cookie on to the browser. Before, such a request extended the session in the database only, so a console in use could be signed out a day after signing in.
+
+### Security
+
+- Query parameters that make an upstream rewrite the HTTP method or request headers (`$httpMethod`, `_method`, `_HttpMethod`, `$httpHeaders`) are refused with `invalid_query`. Before, a connection that allowed only `GET` let an upstream such as a Google API run `GET …?$httpMethod=POST` as a `POST`.
+
+### Upgrade notes
+
+- The migration `0002_token_auth.sql` fails while a connection's rule, or a rule in a pending draft, holds a literal `{` or `}`. Rewrite such rules with `%7B` and `%7D`, deny such drafts, and deploy again, as [docs/deploy.md](docs/deploy.md#upgrading) describes.
+- Update the command line client on every machine, as in Step U4 of [docs/deploy.md](docs/deploy.md#step-u4-update-the-command-line-client), so that it waits long enough for a request that gets a token.
+
 ## [0.5.0] - Unreleased
 
 First public release.

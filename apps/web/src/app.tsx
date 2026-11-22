@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { api, authFault, emptyStatus, Fault, type Status } from './api';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
+import { api, authFault, emptyStatus, Fault, inOrder, replaced, type Status } from './api';
 import { auth, TABS, type AppApi, type Owner, type TabId } from './shell';
 import { Icon, Toasts, useConfirm, type Toast } from './ui';
-import { ConsentPage, DevicePage, LoginPage, Reauth, Setup } from './entry';
+import { CallbackPage, ConsentPage, DevicePage, isCallback, LoginPage, Reauth, Setup } from './entry';
 import { Overview } from './pages/overview';
 import { Secrets } from './pages/secrets';
 import { Connections } from './pages/connections';
@@ -29,7 +29,25 @@ const readTab = (): TabId => {
   return isTab(value) ? value : 'overview';
 };
 
-export function App() {
+/** Rendered with the console only, so the entry pages never poll: runs tick every 15 seconds while the
+ * tab is visible, and once when it becomes visible again. */
+function Poll({ tick }: { tick: RefObject<() => void> }) {
+  useEffect(() => {
+    const run = () => {
+      if (document.visibilityState === 'visible') tick.current();
+    };
+    const timer = setInterval(run, 15_000);
+    document.addEventListener('visibilitychange', run);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', run);
+    };
+  }, [tick]);
+  return null;
+}
+
+/** entry is the path of the script this page loaded, which the server's page at / has to keep naming. */
+export function App({ entry }: { entry: string }) {
   const [boot, setBoot] = useState<'loading' | 'ready' | 'failed'>('loading');
   const [initialized, setInitialized] = useState(false);
   const [owner, setOwner] = useState<Owner>(null);
@@ -51,15 +69,22 @@ export function App() {
     setTimeout(() => setToasts((list) => list.filter((t) => t.id !== id)), error ? 8000 : 4500);
   }, []);
 
+  // Every change of the state goes through this, the null of a page without a session included, so an
+  // older answer never replaces a newer one.
+  const ordered = useMemo(() => inOrder<Status | null>(setStatus), []);
+  const loadStatus = useCallback(
+    () => ordered(async () => (await api('/admin/status')) as unknown as Status),
+    [ordered],
+  );
+  const [updated, setUpdated] = useState(false);
+
   const refresh = useCallback(async () => {
     setInitialized(!!(await api('/healthz')).initialized);
     const session = await auth.getSession();
     const user = session.data?.user as { name: string; email: string } | undefined;
     setOwner(user ? { name: user.name, email: user.email } : null);
-    const next = user ? ((await api('/admin/status')) as unknown as Status) : null;
-    setStatus(next);
-    return next;
-  }, []);
+    return user ? loadStatus() : ordered(async () => null);
+  }, [loadStatus, ordered]);
 
   const run = useCallback(
     async (fn: () => Promise<void>, success = '已完成。') => {
@@ -98,9 +123,9 @@ export function App() {
     // A sign-out the server refused leaves the session alive, so the page must not pretend otherwise.
     const r = await auth.signOut();
     if (r.error) throw authFault(r.error);
-    setStatus(null);
+    await ordered(async () => null);
     setOwner(null);
-  }, []);
+  }, [ordered]);
 
   useEffect(() => {
     void (async () => {
@@ -123,11 +148,38 @@ export function App() {
     return () => removeEventListener('popstate', onPop);
   }, []);
 
+  // What the console does every 15 seconds while it is in view (Poll). It reads only the state, never the
+  // session or /healthz as refresh() does: a page whose session lapsed stays as it is, with whatever the
+  // Owner typed, until an action asks to sign in again, and picks up again by itself once the session is
+  // back (a sign-in in another tab). A failed read is silent. Nothing runs during an action or that dialog.
+  const tick = useRef(() => {});
+  tick.current = () => {
+    if (busy || reauth) return;
+    loadStatus().catch(() => {});
+    fetch('/', { cache: 'no-store' }).then(
+      async (r) => {
+        if (r.ok) setUpdated(replaced(await r.text(), entry));
+      },
+      () => {},
+    );
+  };
+
   const go = useCallback((next: TabId) => {
     history.pushState({}, '', next === 'overview' ? location.pathname : `${location.pathname}?tab=${next}`);
     setTab(next);
     scrollTo({ top: 0 });
   }, []);
+
+  // The callback page has already put the connections page in the address bar; this shows it, with the
+  // credential's new version loaded.
+  const authorized = useCallback(
+    (text: string) => {
+      setTab('connections');
+      notify(text);
+      void refresh();
+    },
+    [notify, refresh],
+  );
 
   const app: AppApi = useMemo(
     () => ({
@@ -193,6 +245,7 @@ export function App() {
   if (!initialized || location.pathname === '/setup') return <Setup app={app} toasts={toastBar} />;
   if (location.pathname === '/device') return <DevicePage app={app} toasts={toastBar} />;
   if (location.pathname === '/consent') return <ConsentPage app={app} toasts={toastBar} />;
+  if (isCallback()) return <CallbackPage app={app} toasts={toastBar} onDone={authorized} />;
   // /login only appears with an OAuth query behind it; without one a signed-in Owner belongs in the console.
   if (!owner || (location.pathname === '/login' && location.search)) return <LoginPage app={app} toasts={toastBar} />;
 
@@ -253,9 +306,28 @@ export function App() {
           </div>
         </nav>
         <main className="main">
+          {updated ? (
+            <div className="alerts">
+              <div className="alert alert--warn" role="status">
+                <span className="alert-icon">
+                  <Icon name="refresh" size={18} />
+                </span>
+                <div className="alert-body">
+                  <strong>控制台已更新</strong>
+                  <p>加载新版本会重新打开本页，还没保存的输入会丢失。</p>
+                  <div className="alert-actions">
+                    <button type="button" className="btn btn--small" onClick={() => location.reload()}>
+                      加载新版本
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
           <Page app={app} />
         </main>
       </div>
+      <Poll tick={tick} />
       {toastBar}
     </>
   );

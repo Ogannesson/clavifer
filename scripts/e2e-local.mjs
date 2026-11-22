@@ -1,6 +1,6 @@
 import { Miniflare, Log, LogLevel, convertV4MiniflareOptions } from 'miniflare';
 import { mkdir } from 'node:fs/promises';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createPrivateKey, randomBytes, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { generateIdentity, identityToRecipient, Decrypter } from 'age-encryption';
 import { createServer } from 'node:http';
@@ -12,6 +12,7 @@ import { hostSmoke } from './host-smoke.mjs';
 import { oauthAcceptance } from './oauth-local-acceptance.mjs';
 import { applyMigrations } from './migrations.mjs';
 import { issueSql, newToken } from './bootstrap-token.mjs';
+import { tokenServer } from './e2e-token-server.mjs';
 
 // Isolated runtime and database; credentials never leave this process or enter logs.
 const origin = 'http://localhost:8787';
@@ -45,9 +46,12 @@ const runtime = (state, key) =>
 const firstKey = rootKey();
 let mf = new Miniflare(runtime('1', firstKey));
 let upstreamCalls = 0;
+// The upstream is also the authorization server of the connections that derive their tokens.
+const fake = tokenServer();
 const upstream = createServer((req, res) => {
   upstreamCalls++;
   const url = new URL(req.url, 'http://localhost');
+  if (fake.handle(req, res, url)) return;
   if (url.pathname === '/echo') {
     res.end(req.headers.authorization);
     return;
@@ -755,6 +759,355 @@ try {
   assert.equal((await tool('access.status', { id: asked.id })).status, 'executed');
   assert.equal((await tool('http.request', there)).error, 'approval_required', 'an approval runs once');
   await call('/admin/connections/' + reaching, { method: 'DELETE', owner: true });
+  // Tokens derived from a credential, by the stand-in authorization server on the upstream. Every
+  // connection calls /whoami, which answers with the Authorization the upstream got.
+  const ref = ($field) => ({ $field });
+  const at = (path) => upstreamOrigin + path;
+  const derivedValues = {
+    client_id: fake.client.id,
+    client_secret: fake.client.secret,
+    private_key: fake.keys.rsa,
+    ec_key: fake.keys.ec,
+    issuer: fake.issuer,
+  };
+  const derivedSecret = (
+    await call('/admin/secrets', {
+      method: 'POST',
+      owner: true,
+      body: { name: 'Derived', values: derivedValues },
+      expected: 201,
+    })
+  ).v.id;
+  const whoamiConnection = async (name, auth, secretId = derivedSecret) =>
+    (
+      await call('/admin/connections', {
+        method: 'POST',
+        owner: true,
+        body: { name, origin: upstreamOrigin, paths: ['/whoami'], methods: ['GET'], auth: { secretId, ...auth } },
+      })
+    ).v.id;
+  const grantInvoke = (connections) =>
+    call('/admin/grants', {
+      method: 'POST',
+      owner: true,
+      body: {
+        clientId: client,
+        grants: connections.map((resourceId) => ({
+          resourceType: 'connection',
+          resourceId,
+          permission: 'connection:invoke',
+        })),
+      },
+    });
+  const version = async (secretId) =>
+    (await db.prepare('SELECT current_version AS v FROM secrets WHERE id=?').bind(secretId).first()).v;
+  // The Owner saves a credential again with one value unchanged: a new version, which every token
+  // cached for the credential was not minted from.
+  const resave = async (secretId, values) =>
+    call(`/admin/secrets/${secretId}`, {
+      method: 'PUT',
+      owner: true,
+      body: {
+        name: secretId === derivedSecret ? 'Derived' : 'Signed-in user',
+        values,
+        expectedVersion: await version(secretId),
+      },
+    });
+  const signedRs = await whoamiConnection('Signed RS256', {
+    type: 'jwt',
+    jwt: { alg: 'RS256', keyField: 'private_key', claims: { iss: ref('issuer'), aud: 'e2e-audience' }, lifetime: 300 },
+  });
+  const signedEs = await whoamiConnection('Signed ES256', {
+    type: 'jwt',
+    jwt: {
+      alg: 'ES256',
+      keyField: 'ec_key',
+      claims: { iss: ref('issuer'), aud: 'e2e-audience' },
+      lifetime: 300,
+      jti: true,
+    },
+  });
+  const clientBasic = await whoamiConnection('Client by Basic', {
+    type: 'oauth-client',
+    client: { method: 'basic', id: ref('client_id'), secretField: 'client_secret' },
+    tokenUrl: at('/token/client'),
+  });
+  const clientJson = await whoamiConnection('Client in a JSON body', {
+    type: 'oauth-client',
+    client: { method: 'post', id: ref('client_id'), secretField: 'client_secret' },
+    bodyFormat: 'json',
+    tokenUrl: at('/token/client'),
+  });
+  const clientAssertion = await whoamiConnection('Client by assertion', {
+    type: 'oauth-client',
+    client: {
+      method: 'jwt',
+      id: ref('client_id'),
+      jwt: {
+        alg: 'PS256',
+        keyField: 'private_key',
+        claims: { iss: ref('client_id'), sub: ref('client_id'), aud: at('/token/client') },
+        lifetime: 60,
+      },
+    },
+    tokenUrl: at('/token/client'),
+  });
+  const bearerAssertion = await whoamiConnection('JWT bearer', {
+    type: 'oauth-jwt',
+    jwt: {
+      alg: 'RS256',
+      keyField: 'private_key',
+      claims: { iss: ref('issuer'), scope: 'e2e.read', aud: at('/token/jwt') },
+      lifetime: 600,
+    },
+    tokenUrl: at('/token/jwt'),
+  });
+  // Saving tried each credential that exchanges, once, and cached the token.
+  assert.deepEqual([fake.calls.client, fake.calls.jwt], [3, 1]);
+  const derivedConnections = [signedRs, signedEs, clientBasic, clientJson, clientAssertion, bearerAssertion];
+  await grantInvoke(derivedConnections);
+  const whoami = async (connection) => {
+    const answer = await tool('http.request', { connection, path: '/whoami' });
+    assert(answer.body, answer.error);
+    return JSON.parse(answer.body).authorization;
+  };
+  // A jwt connection signs a JWT for every request with its key and claims.
+  for (const [connection, alg] of [
+    [signedRs, 'RS256'],
+    [signedEs, 'ES256'],
+  ]) {
+    const presented = await whoami(connection);
+    assert(presented.startsWith('Bearer '));
+    const signed = fake.verifyJwt(presented.slice(7), 'e2e-audience');
+    assert.equal(signed?.header.alg, alg, `${alg}: signed with the connection's key`);
+    assert.equal(signed.claims.iss, fake.issuer);
+    assert.equal(signed.claims.exp - signed.claims.iat, 300);
+  }
+  assert.notEqual(await whoami(signedEs), await whoami(signedEs), 'a JWT with a jti is signed anew for every request');
+  // An exchanging connection presents a token the endpoint issued for its grant.
+  const exchanged = async (connection, grant) => {
+    const presented = await whoami(connection);
+    assert(presented.startsWith('Bearer '));
+    assert.equal(fake.issued.get(presented.slice(7)), grant, `the upstream got a token issued for ${grant}`);
+    return presented.slice(7);
+  };
+  for (const connection of [clientBasic, clientJson, clientAssertion]) await exchanged(connection, 'client');
+  await exchanged(bearerAssertion, 'jwt');
+  assert.deepEqual([fake.calls.client, fake.calls.jwt], [3, 1], 'the tokens saving cached serve the requests');
+  // Eight requests at once on a credential saved anew, while the endpoint takes its time: one exchange,
+  // whose token all of them present.
+  await resave(derivedSecret, { issuer: fake.issuer });
+  fake.settings.delay = 500;
+  const together = await Promise.all(Array.from({ length: 8 }, () => exchanged(clientBasic, 'client')));
+  fake.settings.delay = 0;
+  assert.equal(fake.calls.client, 4, 'eight requests at once exchange once');
+  assert.equal(new Set(together).size, 1);
+  // A token endpoint that refuses, with a code of its own that echoes a credential, or is down, and in
+  // each case says in its description everything it was sent: the Agent's hint and the audit name the
+  // endpoint's host, the status and a code RFC 6749 defines, and no value of the credential.
+  const since = Date.now();
+  const hints = [];
+  for (const [connection, failure, code] of [
+    [clientBasic, { status: 401, error: 'invalid_client' }, 'token_exchange_failed'],
+    [clientJson, { status: 400, error: fake.client.secret }, 'token_exchange_failed'],
+    [bearerAssertion, { status: 503, error: 'temporarily_unavailable' }, 'token_unavailable'],
+  ]) {
+    await resave(derivedSecret, { issuer: fake.issuer });
+    fake.settings.failure = failure;
+    const refused = await tool('http.request', { connection, path: '/whoami' });
+    assert.equal(refused.error, code);
+    assert(
+      refused.hint.includes(new URL(upstreamOrigin).host) && refused.hint.includes(`HTTP ${failure.status}`),
+      'the hint names the token endpoint and its status',
+    );
+    hints.push(refused.hint);
+  }
+  fake.settings.failure = undefined;
+  assert(hints[0].includes('(invalid_client)') && hints[1].includes('(unrecognized)'), 'only a defined code is named');
+  const exchangeAudit = (
+    await db
+      .prepare(
+        "SELECT result FROM audit_events WHERE action='token:exchange' AND resource_id=? AND created_at>=? ORDER BY created_at",
+      )
+      .bind(derivedSecret, since)
+      .all()
+  ).results.map((row) => row.result);
+  assert.deepEqual(exchangeAudit, ['invalid_client', 'unrecognized', 'unavailable']);
+  const audited = (await db.prepare('SELECT * FROM audit_events WHERE created_at>=?').bind(since).all()).results;
+  const credentialValues = [
+    ...Object.values(derivedValues),
+    // A line of each private key, should a key be cut short.
+    ...[fake.keys.rsa, fake.keys.ec].map((pem) => pem.split('\n')[1]),
+  ];
+  assert.equal(
+    [...hints, ...audited.flatMap((row) => Object.values(row).map(String))].filter((text) =>
+      credentialValues.some((value) => text.includes(value)),
+    ).length,
+    0,
+    'no hint or audit row carries a value of the credential',
+  );
+  await exchanged(clientJson, 'client');
+  // A user's authorization. The connection is saved before its credential holds a refresh token and is
+  // authorized by the Owner at the stand-in's authorization endpoint, whose redirect the browser would
+  // follow to the console's callback page; the page's part is played here.
+  const userSecret = (
+    await call('/admin/secrets', {
+      method: 'POST',
+      owner: true,
+      body: { name: 'Signed-in user', values: { client_id: fake.client.id, client_secret: fake.client.secret } },
+      expected: 201,
+    })
+  ).v.id;
+  const userAuth = {
+    type: 'oauth-refresh',
+    refreshField: 'refresh_token',
+    client: { method: 'basic', id: ref('client_id'), secretField: 'client_secret' },
+    authorize: { url: at('/authorize'), scope: 'e2e.read e2e.write', params: { access_type: 'offline' } },
+    tokenUrl: at('/token/refresh'),
+  };
+  const signedIn = await whoamiConnection('Signed-in user', userAuth, userSecret);
+  const callback = `${origin}/oauth/callback/${signedIn}`;
+  assert.equal(
+    (await call('/admin/status', { owner: true })).v.connections.find((c) => c.id === signedIn).callback,
+    callback,
+    'the status names the callback to register upstream',
+  );
+  await grantInvoke([signedIn]);
+  const early = await tool('http.request', { connection: signedIn, path: '/whoami' });
+  assert.equal(early.error, 'token_exchange_failed');
+  assert(early.hint.includes('not been authorized'), 'a connection not authorized yet says so');
+  assert.equal(fake.calls.refresh, 0, 'and asks no token endpoint');
+  async function authorize() {
+    const started = (await call(`/admin/connections/${signedIn}/authorize`, { method: 'POST', owner: true })).v;
+    const url = new URL(started.url);
+    assert.equal(started.host, url.host);
+    assert.deepEqual(
+      Object.fromEntries([...url.searchParams].filter(([name]) => !['state', 'code_challenge'].includes(name))),
+      {
+        access_type: 'offline',
+        response_type: 'code',
+        client_id: fake.client.id,
+        redirect_uri: callback,
+        scope: 'e2e.read e2e.write',
+        code_challenge_method: 'S256',
+      },
+    );
+    const answer = await fetch(url, { redirect: 'manual' });
+    assert.equal(answer.status, 302);
+    const back = new URL(answer.headers.get('location'));
+    assert.equal(back.origin + back.pathname, callback);
+    assert.equal(back.searchParams.get('state'), url.searchParams.get('state'));
+    return back;
+  }
+  const complete = (back, expected = 200) =>
+    call('/admin/oauth/complete', {
+      method: 'POST',
+      owner: true,
+      body: { connection: signedIn, state: back.searchParams.get('state'), code: back.searchParams.get('code') },
+      expected,
+    });
+  fake.settings.deny = true;
+  assert.equal((await authorize()).searchParams.get('error'), 'access_denied');
+  fake.settings.deny = false;
+  fake.settings.refresh = false;
+  assert.equal((await complete(await authorize(), 502)).v.error, 'no_refresh_token');
+  fake.settings.refresh = true;
+  assert.equal(await version(userSecret), 1, 'an answer without a refresh token stores nothing');
+  const authorized = await authorize();
+  assert.deepEqual((await complete(authorized)).v, { ok: true });
+  assert.equal((await complete(authorized, 400)).v.error, 'authorization_expired', 'a state completes once');
+  assert.equal(await version(userSecret), 2, 'the refresh token is the credential’s next version');
+  await exchanged(signedIn, 'code');
+  assert.deepEqual([fake.calls.code, fake.calls.refresh], [2, 0], 'the code exchange cached its access token');
+  // A second connection on that credential with a narrower scope, another recipe of one refresh token,
+  // which the endpoint rotates on every use. Saving tries it.
+  const narrower = await whoamiConnection(
+    'Signed-in user read only',
+    { ...userAuth, authorize: undefined, scope: 'e2e.read' },
+    userSecret,
+  );
+  await grantInvoke([narrower]);
+  assert.deepEqual([fake.calls.refresh, await version(userSecret)], [1, 3], 'saving rotated the refresh token');
+  // With tokens that expire within the cache's margin no token is reused, so six requests at once on
+  // both connections refresh six times, one after another under the credential's lock, each with the
+  // refresh token the one before stored.
+  await resave(userSecret, { client_id: fake.client.id });
+  fake.settings.lifetime = 60;
+  const rotations = await Promise.all(
+    Array.from({ length: 6 }, (_, i) => exchanged(i % 2 ? narrower : signedIn, 'refresh')),
+  );
+  fake.settings.lifetime = 3600;
+  assert.equal(new Set(rotations).size, 6);
+  assert.deepEqual([fake.calls.refresh, await version(userSecret)], [7, 10]);
+  // Once the tokens last, each recipe refreshes once more and then both are served from the cache: a
+  // rotation carries the other recipe's token to the new version.
+  for (let i = 0; i < 4; i++) await exchanged(i % 2 ? narrower : signedIn, 'refresh');
+  assert.deepEqual([fake.calls.refresh, await version(userSecret)], [9, 12]);
+  assert.equal(fake.calls.reused, 0, 'no refresh token was used twice');
+  assert.equal(fake.live.size, 1, 'every refresh token but the stored one was used');
+  assert.deepEqual(
+    (
+      await db
+        .prepare(
+          "SELECT client_id AS actor,COUNT(*) AS n FROM audit_events WHERE action='secret:rotate' AND resource_id=? GROUP BY client_id ORDER BY client_id",
+        )
+        .bind(userSecret)
+        .all()
+    ).results,
+    [
+      { actor: 'owner', n: 2 },
+      { actor: 'system', n: 9 },
+    ],
+    'the authorization and the Owner’s save are the Owner’s, every rotation the system’s',
+  );
+  // What a jwt connection's signing costs per request in workerd, whose CPU time a request on the free
+  // plan has 10 ms of: importing the key and signing, n times in a Worker, the difference of the
+  // fastest of five runs at 101 and at 1, over 100.
+  const signer = new Miniflare(
+    convertV4MiniflareOptions({
+      modules: true,
+      compatibilityDate: '2026-09-11',
+      compatibilityFlags: ['nodejs_compat'],
+      log: new Log(LogLevel.ERROR),
+      script: `export default {
+        async fetch(request) {
+          const { alg, key, n } = await request.json();
+          const algorithm = alg === 'RS256' ? { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' } : { name: 'ECDSA', namedCurve: 'P-256', hash: 'SHA-256' };
+          const der = Uint8Array.from(atob(key), (c) => c.charCodeAt(0));
+          const data = new TextEncoder().encode('header.claims');
+          for (let i = 0; i < n; i++)
+            await crypto.subtle.sign(algorithm, await crypto.subtle.importKey('pkcs8', der, algorithm, false, ['sign']), data);
+          return new Response('signed');
+        },
+      };`,
+    }),
+  );
+  try {
+    const perSignature = async (alg, pem) => {
+      const key = createPrivateKey(pem).export({ type: 'pkcs8', format: 'der' }).toString('base64');
+      const fastest = async (n) => {
+        const times = [];
+        for (let run = 0; run < 5; run++) {
+          const start = performance.now();
+          const r = await signer.dispatchFetch('http://signer/', {
+            method: 'POST',
+            body: JSON.stringify({ alg, key, n }),
+          });
+          assert.equal(await r.text(), 'signed');
+          times.push(performance.now() - start);
+        }
+        return Math.min(...times);
+      };
+      return ((await fastest(101)) - (await fastest(1))) / 100;
+    };
+    const rs = await perSignature('RS256', fake.keys.rsa);
+    const es = await perSignature('ES256', fake.keys.ec);
+    console.log(
+      `Signing a JWT in workerd, the key's import included: RS256 ${rs.toFixed(2)} ms, ES256 ${es.toFixed(2)} ms.`,
+    );
+  } finally {
+    await signer.dispose();
+  }
   const sdk = new Client({ name: 'host-contract-test', version: '1' });
   // The test binary stands in for clavifer, both as the bridge and as the waitCommand it names.
   const helperEnv = {
@@ -776,6 +1129,15 @@ try {
     assert.equal(JSON.parse(listed.content[0].text).items.length, 1);
     const invoked = await sdk.callTool({ name: 'http.request', arguments: { connection, path: '/get' } });
     assert.equal(JSON.parse(JSON.parse(invoked.content[0].text).body).credentialCorrect, true);
+    const bridged = await sdk.callTool({
+      name: 'http.request',
+      arguments: { connection: bearerAssertion, path: '/whoami' },
+    });
+    assert.equal(
+      fake.issued.get(JSON.parse(JSON.parse(bridged.content[0].text).body).authorization.slice(7)),
+      'jwt',
+      'through the bridge a derived token reaches the upstream',
+    );
     // Through the bridge a submitted request names the command that waits for the Owner. Run in a
     // host's shell, it keeps waiting while the request is pending and exits with the decision.
     const submitted = JSON.parse(
@@ -809,6 +1171,8 @@ try {
   } finally {
     await sdk.close();
   }
+  for (const cid of [...derivedConnections, signedIn, narrower])
+    await call('/admin/connections/' + cid, { method: 'DELETE', owner: true });
   if (process.argv.includes('--hosts'))
     await hostSmoke({ server: (await mf.ready).origin, client_id: client }, refreshed);
   // Real HTTP sockets verify auth injection and binary byte fidelity end to end.
@@ -923,7 +1287,7 @@ try {
   await call('/v1/access-requests/sealed-000001', { bearer: true, expected: 404 });
   assert.equal((await call('/v1/access-requests/sealed-002000', { bearer: true })).v.status, 'denied');
   assert.equal((await call('/admin/backup/status', { owner: true })).v.lastError, null);
-  // The automatic backup that followed: the v1 snapshot, naming the segment by its key and checksum.
+  // The automatic backup that followed: the v2 snapshot, naming the segment by its key and checksum.
   const latest = await mf.dispatchFetch(origin + '/admin/backup/latest', { headers: { cookie } });
   assert.equal(latest.status, 200);
   const decrypter = new Decrypter();
@@ -934,7 +1298,7 @@ try {
     .map((line) => JSON.parse(line));
   assert.deepEqual(
     [snapshot[0].format, snapshot[0].kind, snapshot.at(-1).type],
-    ['clavifer-backup-v1', 'automatic', 'end'],
+    ['clavifer-backup-v2', 'automatic', 'end'],
   );
   assert(snapshot.some((r) => r.type === 'secret-version' && r.values.token === 'rotated-test-only'));
   assert.equal(snapshot.filter((r) => r.type === 'archive-identity').length, 1);
@@ -1200,7 +1564,7 @@ try {
     body: { email: 'second@example.com', password: changedPassword },
   });
   console.log(
-    `Local E2E passed: ${passed} HTTP assertions plus SDK-to-Go-to-Worker MCP, proxy boundaries, encrypted backup, sealing of old access requests, Owner setup and recovery through one-time tokens, and a second instance under another root key.`,
+    `Local E2E passed: ${passed} HTTP assertions plus SDK-to-Go-to-Worker MCP, proxy boundaries, tokens derived at a stand-in authorization server, encrypted backup, sealing of old access requests, Owner setup and recovery through one-time tokens, and a second instance under another root key.`,
   );
 } finally {
   await mf.dispose();

@@ -10,7 +10,8 @@ import {
   requestInput,
   invokeInput,
   resourceId,
-  valuesSchema,
+  setupValues,
+  completeInput,
 } from '../apps/worker/src/vault.ts';
 import { recipientInput } from '../apps/worker/src/export.ts';
 import { ownerInput, resetInput } from '../apps/worker/src/setup.ts';
@@ -109,7 +110,7 @@ const paths = {
       operationId: 'startImport',
       summary: 'Start importing a snapshot into an uninitialized instance',
       description:
-        'Same origin only. The console decrypts a clavifer-backup-v1 snapshot in the browser and sends its header and owner records here; the rest follow in chunks and a commit. Spends the token issued for an uninitialized instance (valid 24 hours) and in one transaction empties the instance and records the import, whose id the response returns: like the token it grants the import, and it only ever travels in bodies. A header of a later format, or an Owner password derived with other scrypt parameters, is refused with invalid_snapshot; an initialized instance with already_initialized. A new start replaces any import in progress.',
+        'Same origin only. The console decrypts a clavifer-backup-v2 or clavifer-backup-v1 snapshot in the browser and sends its header and owner records here; the rest follow in chunks and a commit, each read in the format the header names. Spends the token issued for an uninitialized instance (valid 24 hours) and in one transaction empties the instance and records the import, whose id the response returns: like the token it grants the import, and it only ever travels in bodies. A header of a later format is refused with snapshot_from_newer_version and an Owner password derived with other scrypt parameters with invalid_snapshot, both before the token is spent; an initialized instance with already_initialized. A new start replaces any import in progress.',
       parameters: [bootstrapToken],
       requestBody: { required: true, content: { 'application/json': { schema: ref('ImportStart') } } },
       responses: {
@@ -126,7 +127,7 @@ const paths = {
       operationId: 'importChunk',
       summary: 'Write a chunk of snapshot records',
       description:
-        'Same origin only. Records of the types secret to segment, each checked against the v1 format, written in one transaction with the chunk seq, so a chunk sent again answers written without writing twice. Only structure and references are checked, never the business rules of this version. Credential versions are encrypted under this instance’s root key; an embedded segment is stored under a new key after its SHA-256 matched. A referenced segment (automatic backup) must be in this instance’s bucket with the checksum its record names; when one is not, nothing is written and missing lists them, and the chunk can be sent again with those in skip to go on without them. An import that is no longer the one in progress is refused with import_superseded, before the body is read when no import is in progress at all. Up to 8 MiB and 64 KiB.',
+        'Same origin only. Records of the types secret to segment, each checked against the format of the import’s header, written in one transaction with the chunk seq, so a chunk sent again answers written without writing twice. Only structure and references are checked, never the business rules of this version; a rule holding a literal { or }, which v2 reads as a wildcard, in a v1 connection or in the setup or update draft of a v1 access request still pending and unexpired is refused with backup_has_unconvertible_rule, and a header format this version does not read (an import a later version started) with snapshot_from_newer_version. Credential versions are encrypted under this instance’s root key; an embedded segment is stored under a new key after its SHA-256 matched. A referenced segment (automatic backup) must be in this instance’s bucket with the checksum its record names; when one is not, nothing is written and missing lists them, and the chunk can be sent again with those in skip to go on without them. An import that is no longer the one in progress is refused with import_superseded, before the body is read when no import is in progress at all. Up to 8 MiB and 64 KiB.',
       requestBody: { required: true, content: { 'application/json': { schema: ref('ImportChunk') } } },
       responses: {
         200: json('Written, or the referenced segments that are not in the bucket', {
@@ -157,6 +158,8 @@ const paths = {
     get: {
       operationId: 'adminStatus',
       summary: 'Owner dashboard state',
+      description:
+        'A connection with authorize carries callback, the redirect URI to register at its upstream; a pending setup carries callbacks, those of the connections it creates with authorize, by connection id.',
       security: owner,
       responses: {
         200: {
@@ -263,6 +266,69 @@ const paths = {
       responses: { 200: json('Deleted', { ok: { type: 'boolean' } }), 401: error, 403: error },
     },
   },
+  '/admin/connections/{id}/authorize': {
+    parameters: [{ $ref: '#/components/parameters/ResourceId' }],
+    post: {
+      operationId: 'startAuthorization',
+      summary: 'Start authorizing a connection at its upstream',
+      description:
+        'Requires a login within the last 10 minutes. Only a connection of type oauth-refresh with authorize (authorization_not_configured otherwise) whose client has an id (client_id_required). Answers the authorization URL, with response_type code, the client id, the redirect URI <origin>/oauth/callback/<connection id>, the scope of authorize, a new state, a PKCE S256 challenge and the parameters of authorize, and its host; the console sends the browser there. The state is good for 10 minutes, in this session, for this connection as it is configured now.',
+      security: owner,
+      responses: {
+        200: json('Authorization URL', { url: { type: 'string', format: 'uri' }, host: { type: 'string' } }, [
+          'url',
+          'host',
+        ]),
+        400: error,
+        401: error,
+        403: error,
+        404: error,
+      },
+    },
+  },
+  '/admin/oauth/complete': {
+    post: {
+      operationId: 'completeAuthorization',
+      summary: 'Complete an authorization with the code the upstream sent back',
+      description:
+        'Spends the state whatever the outcome. Refused with authorization_expired when the state is unknown, more than 10 minutes old, spent, was issued to another session or for another connection, or under a root key no longer in the ring, with token_unavailable when another exchange of the credential leaves less than 10 seconds for this one (nothing is sent; start again), and with connection_changed when the connection was changed or deleted since. The code is exchanged at the token endpoint with the PKCE verifier, and the refresh token in the answer is stored as the next version of the credential (the field is added when missing), over any version saved meanwhile; every token cached before ends. An answer without a refresh token stores nothing (no_refresh_token); a refusal of the token endpoint carries what it said in token_endpoint, as saving a connection does. An answer without expires_in for a connection without ttl stores the refresh token and adds a ttl_required warning.',
+      security: owner,
+      requestBody: { required: true, content: { 'application/json': { schema: ref('AuthorizationCompletion') } } },
+      responses: {
+        200: {
+          description: 'Authorized',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  ok: { type: 'boolean' },
+                  warnings: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        connection: { type: 'string' },
+                        error: { type: 'string', enum: ['ttl_required'] },
+                        hint: { type: 'string' },
+                      },
+                    },
+                  },
+                },
+                required: ['ok'],
+              },
+            },
+          },
+        },
+        400: error,
+        401: error,
+        403: error,
+        409: error,
+        502: error,
+        503: error,
+      },
+    },
+  },
   '/admin/grants': {
     post: {
       operationId: 'grantResources',
@@ -290,7 +356,7 @@ const paths = {
       operationId: 'decideAccessRequest',
       summary: 'Approve or deny a pending access request',
       description:
-        'Approving may only revive a grant that is not live. When a live grant covers the same resource with a different field subset the request is refused with existing_grant_conflict, so the Owner changes the subset in the administration form instead. An approval may set expiresAt (milliseconds, or null until revoked); without it the grant lasts 24 hours. A live grant never loses reach to a shorter expiry. Approving an invocation request ignores the body, unless the invocation names another origin than its connection’s own: then origin has to repeat that origin as stored, or the approval is refused with origin_mismatch. The exact request may run once within 10 minutes. Approving a setup with a credential takes values holding exactly its fields; the credential, every connection and the approval are written in one batch under the ids fixed on submission, so a failure creates none of them; a credential name already taken (also by a deleted credential) is refused with secret_name_taken. Approving an update ignores the body and is refused with connection_changed when the connection changed after submission. Denying ignores the body.',
+        'Approving may only revive a grant that is not live. When a live grant covers the same resource with a different field subset the request is refused with existing_grant_conflict, so the Owner changes the subset in the administration form instead. An approval may set expiresAt (milliseconds, or null until revoked); without it the grant lasts 24 hours. A live grant never loses reach to a shorter expiry. Approving an invocation request ignores the body, unless the invocation names another origin than its connection’s own: then origin has to repeat that origin as stored, or the approval is refused with origin_mismatch. The exact request may run once within 10 minutes. Approving a setup with a credential takes values holding exactly its fields, except that a field only connections with authorize read, as their refresh token, may be left out for authorizing to write; the credential, every connection and the approval are written in one batch under the ids fixed on submission, so a failure creates none of them; a credential name already taken (also by a deleted credential) is refused with secret_name_taken. Approving an update ignores the body and is refused with connection_changed when the connection changed after submission. Denying ignores the body.',
       security: owner,
       requestBody: { required: false, content: { 'application/json': { schema: ref('AccessDecision') } } },
       responses: {
@@ -306,7 +372,7 @@ const paths = {
   '/admin/backup/export': {
     get: {
       operationId: 'fullExport',
-      summary: 'Stream the complete state of the instance as an age-encrypted v1 full snapshot',
+      summary: 'Stream the complete state of the instance as an age-encrypted v2 full snapshot',
       description:
         'Requires a login within the last 10 minutes and Sec-Fetch-Site: same-origin (a browser download started by the console itself; anything else is refused with cross_site_request). Every sealed segment is embedded; one missing from the bucket or without the checksum its manifest row recorded refuses the export before the first byte (archive_segment_unavailable), as an inconsistent instance does (backup_has_*). The download is whole only once GET /admin/backup/exports/{id} reports complete: a stream that breaks off still ends cleanly for the client.',
       security: owner,
@@ -316,7 +382,7 @@ const paths = {
       ],
       responses: {
         200: {
-          description: 'Age-encrypted JSON Lines snapshot (clavifer-backup-v1, kind full)',
+          description: 'Age-encrypted JSON Lines snapshot (clavifer-backup-v2, kind full)',
           content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } },
         },
         400: error,
@@ -399,11 +465,11 @@ const paths = {
       operationId: 'downloadLatestBackup',
       summary: 'Download latest encrypted automatic backup',
       description:
-        'A v1 snapshot of kind automatic. It names each sealed segment by its key in the same bucket instead of carrying it, so it is complete only together with that bucket.',
+        'A v2 snapshot of kind automatic. It names each sealed segment by its key in the same bucket instead of carrying it, so it is complete only together with that bucket.',
       security: owner,
       responses: {
         200: {
-          description: 'Age-encrypted JSON Lines snapshot (clavifer-backup-v1, kind automatic)',
+          description: 'Age-encrypted JSON Lines snapshot (clavifer-backup-v2, kind automatic)',
           content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } },
         },
         401: error,
@@ -596,10 +662,11 @@ const schemas = {
   AccessDecision: schema(
     z.object({
       expiresAt: z.number().int().nullable().optional(),
-      values: valuesSchema.optional(),
+      values: setupValues.optional(),
       origin: z.string().optional(),
     }),
   ),
+  AuthorizationCompletion: schema(completeInput),
   BackupConfigInput: schema(z.object({ recipient: recipientInput.nullable() })),
   InvokeInput: schema(invokeInput),
   Error: {

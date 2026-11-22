@@ -12,6 +12,7 @@ import { SCOPES } from '../packages/auth/policy';
 import {
   COUNTED_TYPES,
   SCRYPT,
+  SNAPSHOT_FORMAT,
   SnapshotValidator,
   readRecords,
   serializeRecord,
@@ -346,6 +347,23 @@ describe('importing the v1 samples', { timeout: 120_000 }, () => {
     });
 });
 
+describe('importing the v2 samples', { timeout: 120_000 }, () => {
+  for (const name of ['automatic-a.age', 'full-a.age'])
+    it(`imports ${name} whole, and backs up what it imported`, async () => {
+      const bytes = new Uint8Array(await readFile(`tests/fixtures/v2/${name}`));
+      const source = await records(bytes);
+      const target = await instance();
+      expect(await target.importFile(bytes, await target.issue())).toEqual(source[0]);
+      // Every kind of authentication came over, the connection not yet authorized included.
+      expectImported(source, await exported(target), true);
+      expect(await target.signIn('owner@example.com', 'synthetic-v2-fixture-password')).toBe(200);
+      // No token came along: the first request through a connection exchanges anew.
+      expect(await target.sql('SELECT COUNT(*) AS n FROM token_cache')).toEqual([{ n: 0 }]);
+      const [{ value: owner }] = await target.sql("SELECT value FROM system_state WHERE key='owner_user_id'");
+      expect(await target.runAutomaticBackup(target.env, owner as string, true)).toMatchObject({ outcome: 'saved' });
+    });
+});
+
 /** Instance X with every kind of data: credentials with several versions and a tombstone, connections,
  * installations (one revoked), active and revoked grants, a request in every status, a Passkey, and audit
  * rows and access requests sealed in several segments. */
@@ -576,12 +594,12 @@ describe('moving to another instance', { timeout: 180_000 }, () => {
 });
 
 /** The smallest snapshot there is, of kind, plus the records given; end is added by file(). */
-async function minimal(kind: 'full' | 'automatic' = 'full') {
+async function minimal(kind: 'full' | 'automatic' = 'full', format: string = SNAPSHOT_FORMAT) {
   const [salt, key] = (await hashPassword(PASSWORD)).split(':');
   return [
     {
       type: 'header',
-      format: 'clavifer-backup-v1',
+      format,
       kind,
       createdAt: Date.now(),
       source: { origin: A, rpId: 'localhost', version: '0.5.0' },
@@ -1299,6 +1317,122 @@ describe('the import protocol', { timeout: 120_000 }, () => {
       await target.issue(),
     );
     expect(await target.initialized()).toBe(true);
+  });
+
+  it('reads each record in the format of its header, and refuses what v2 cannot hold', async () => {
+    const bound = (auth: unknown, deny: string[] = [], values: Record<string, string> = { token: 't', key: 'k' }) =>
+      [
+        {
+          type: 'secret',
+          id: 's',
+          name: 'S',
+          description: '',
+          status: 'active',
+          currentVersion: 1,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+        { type: 'secret-version', secretId: 's', version: 1, values, createdAt: 1 },
+        {
+          type: 'connection',
+          id: 'c',
+          name: 'C',
+          origin: 'https://api.example.com',
+          description: '',
+          auth,
+          policy: { paths: ['/'], methods: ['GET'], deny, approval: [], free: [], hosts: [], anyHost: false },
+          status: 'active',
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ] as SnapshotRecord[];
+    const bearer = { type: 'bearer', secretId: 's', field: 'token' };
+    const signed = (keyField = 'key') => ({
+      type: 'jwt',
+      secretId: 's',
+      jwt: { alg: 'HS256', keyField, keyEncoding: 'utf8', claims: { aud: 'a' }, lifetime: 60 },
+    });
+    const v1 = async (...extra: SnapshotRecord[]) => [...(await minimal('full', 'clavifer-backup-v1')), ...extra];
+    const v2 = async (...extra: SnapshotRecord[]) => [...(await minimal()), ...extra];
+
+    // A v1 rule with a literal brace would turn into a wildcard: the console refuses it as it reads the
+    // file, and the service a chunk sent past the console, as it does a kind of authentication v1 lacks.
+    let target = await instance();
+    await expect(
+      target.importFile(await file(await v1(...bound(bearer, ['DELETE /v1/{id}']))), await target.issue()),
+    ).rejects.toMatchObject({ code: 'backup_has_unconvertible_rule' });
+    const [header, owner] = await minimal('full', 'clavifer-backup-v1');
+    const importId = String(
+      (await target.post('/api/setup/import', { header, owner }, { 'x-bootstrap-token': await target.issue() }))
+        .importId,
+    );
+    for (const [records, code] of [
+      [bound(bearer, ['DELETE /v1/{id}']), 'backup_has_unconvertible_rule'],
+      [bound(signed()), 'invalid_snapshot'],
+    ] as const)
+      await expect(target.post('/api/setup/import/chunk', { importId, seq: 0, records })).rejects.toMatchObject({
+        code,
+      });
+    expect(await target.sql('SELECT seq FROM import_chunks')).toEqual([]);
+    // Encoded, the brace is literal in both formats.
+    target = await instance();
+    await target.importFile(await file(await v1(...bound(bearer, ['DELETE /v1/%7Bid%7D']))), await target.issue());
+    expect(await target.initialized()).toBe(true);
+
+    // v2 holds the new kinds and syntax; a field an auth reads must be there, but the refresh token of a
+    // connection the Owner is yet to authorize.
+    target = await instance();
+    await target.importFile(await file(await v2(...bound(signed(), ['DELETE /v1/{id}']))), await target.issue());
+    expect(await target.sql('SELECT auth_json FROM connections')).toEqual([{ auth_json: JSON.stringify(signed()) }]);
+    target = await instance();
+    await expect(
+      target.importFile(await file(await v2(...bound(signed('gone')))), await target.issue()),
+    ).rejects.toMatchObject({
+      code: 'snapshot_inconsistent',
+      message: expect.stringContaining('connection c injects'),
+    });
+    const refresh = (authorize: boolean) => ({
+      type: 'oauth-refresh',
+      secretId: 's',
+      refreshField: 'refresh_token',
+      client: { method: 'post', id: 'client', secretField: 'key' },
+      ...(authorize && { authorize: { url: 'https://auth.example.com/authorize' } }),
+      tokenUrl: 'https://auth.example.com/token',
+    });
+    await expect(
+      target.importFile(await file(await v2(...bound(refresh(false)))), await target.issue()),
+    ).rejects.toMatchObject({
+      code: 'snapshot_inconsistent',
+      message: expect.stringContaining('connection c injects'),
+    });
+    await target.importFile(await file(await v2(...bound(refresh(true)))), await target.issue());
+    expect(await target.initialized()).toBe(true);
+
+    // A later format is refused before the token is spent, by the console and by the service.
+    target = await instance();
+    const later = { ...header, format: 'clavifer-backup-v3' } as unknown as SnapshotRecord;
+    const token = await target.issue();
+    await expect(target.importFile(await file([later, owner]), token)).rejects.toMatchObject({
+      code: 'snapshot_from_newer_version',
+    });
+    await expect(
+      target.post('/api/setup/import', { header: later, owner }, { 'x-bootstrap-token': token }),
+    ).rejects.toMatchObject({ code: 'snapshot_from_newer_version' });
+    const started = String(
+      (await target.post('/api/setup/import', { header, owner }, { 'x-bootstrap-token': token })).importId,
+    );
+    // An import a later version started, before the Worker was rolled back to this one.
+    await target.sql(
+      "UPDATE system_state SET value=json_set(value,'$.header.format','clavifer-backup-v3') WHERE key='import_id'",
+    );
+    for (const [path, body] of [
+      ['/api/setup/import/chunk', { importId: started, seq: 0, records: [installation('client')] }],
+      [
+        '/api/setup/import/commit',
+        { importId: started, settings: { type: 'settings', backupRecipient: null }, archiveIdentity: null, end: {} },
+      ],
+    ] as const)
+      await expect(target.post(path, body)).rejects.toMatchObject({ code: 'snapshot_from_newer_version' });
   });
 });
 

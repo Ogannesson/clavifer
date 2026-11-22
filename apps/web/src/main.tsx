@@ -7,7 +7,8 @@ import { ConfirmProvider } from './ui';
 createRoot(document.querySelector<HTMLDivElement>('#app')!).render(
   <StrictMode>
     <ConfirmProvider>
-      <App />
+      {/* This module is the entry script (/assets/index-<hash>.js once built), which a deployment replaces. */}
+      <App entry={new URL(import.meta.url).pathname} />
     </ConfirmProvider>
   </StrictMode>,
 );

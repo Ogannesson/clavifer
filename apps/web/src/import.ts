@@ -14,10 +14,11 @@ const encoder = new TextEncoder();
 
 /**
  * Imports an age-encrypted snapshot file into the uninitialized instance the token was issued for. The
- * file is decrypted with identity and read record by record as it streams, each checked against the v1
- * format, and sent in chunks: no more than one chunk is held. When the service does not find referenced
- * segments in its bucket, missing decides whether to go on without them; declining stops the import and
- * resolves null, leaving the instance uninitialized. Resolves the snapshot's header once imported.
+ * file is decrypted with identity and read record by record as it streams, each checked against the format
+ * its header names (v1 or v2), and sent in chunks: no more than one chunk is held. When the service does
+ * not find referenced segments in its bucket, missing decides whether to go on without them; declining
+ * stops the import and resolves null, leaving the instance uninitialized. Resolves the snapshot's header
+ * once imported.
  */
 export async function importSnapshot({
   file,

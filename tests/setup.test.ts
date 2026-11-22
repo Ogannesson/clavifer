@@ -193,6 +193,7 @@ describe('create the Owner', () => {
       "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\\_%' ESCAPE '\\' AND name NOT IN ('d1_migrations','sqlite_sequence','system_state','backup_state')",
     )) as { name: string }[];
     expect(tables.length).toBeGreaterThan(20);
+    expect(tables.map((t) => t.name)).toEqual(expect.arrayContaining(['token_cache', 'token_locks', 'oauth_flows']));
     // How to find the stale row again: by its id, or by its first text column where it has no id.
     const stale: Record<string, string> = {};
     for (const { name } of tables) {
@@ -301,6 +302,28 @@ describe('create the Owner', () => {
     );
     expect(response.status).toBe(200);
     expect(await rows('SELECT recipient FROM backup_state')).toEqual([{ recipient: other }]);
+  });
+
+  it('renews the session cookie on an admin request once the session is due to be extended', async () => {
+    const { cookie } = await signIn(password);
+    const status = () => worker.fetch(new Request(origin + '/admin/status', { headers: { cookie } }), env, context);
+    // A session extended less than an hour ago (updateAge) is left as it is.
+    expect((await status()).headers.getSetCookie()).toEqual([]);
+    // One extended more than an hour ago gets a day again, in the database and in the browser's cookie,
+    // even when the request is a console's poll of the state.
+    const [{ token }] = (await rows('SELECT token FROM session ORDER BY createdAt DESC LIMIT 1')) as {
+      token: string;
+    }[];
+    await env.DB.prepare('UPDATE session SET expiresAt=expiresAt-3700000 WHERE token=?').bind(token).run();
+    const response = await status();
+    expect(response.status).toBe(200);
+    const renewed = response.headers.getSetCookie().find((c) => c.includes('session_token='));
+    expect(renewed).toMatch(/Max-Age=86400/);
+    expect(renewed!.split(';')[0]).toBe(cookie.split('; ').find((c) => c.includes('session_token=')));
+    const [{ expiresAt }] = (await rows('SELECT expiresAt FROM session WHERE token=?', token)) as {
+      expiresAt: number;
+    }[];
+    expect(expiresAt - Date.now()).toBeGreaterThan(86_400_000 - 5000);
   });
 });
 

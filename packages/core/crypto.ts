@@ -60,6 +60,7 @@ const labels = {
   kek: 'clavifer/v1/kek',
   'better-auth': 'clavifer/v1/better-auth',
   fingerprint: 'clavifer/v1/fingerprint',
+  pkce: 'clavifer/v1/pkce',
 };
 /** HKDF-SHA256 with an empty salt (the root key is already 32 uniformly random bytes), 32 bytes per use. */
 export async function deriveKey(root: Uint8Array, use: keyof typeof labels) {
@@ -77,6 +78,19 @@ export async function deriveKey(root: Uint8Array, use: keyof typeof labels) {
     ),
   );
 }
+/** The PKCE code_verifier (RFC 7636 §4.1) of the authorization that state names: an HMAC of state under
+ * a key derived from root, so it is computed again on completion and never stored. 32 bytes in base64url
+ * are 43 characters, the shortest verifier allowed. */
+export async function pkceVerifier(root: RootKey, state: string) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    (await deriveKey(root.key, 'pkce')) as unknown as ArrayBuffer,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  return encode(new Uint8Array(await crypto.subtle.sign('HMAC', key, utf8.encode(state) as unknown as ArrayBuffer)));
+}
 /** The fingerprint of every key in the ring, which the database records when the Owner is created. Not a secret. */
 export async function rootKeyFingerprints(ring: RootKey[]) {
   const entries = await Promise.all(
@@ -92,6 +106,11 @@ export type SecretIdentity = { ownerId: string; secretId: string; version: numbe
 const secretAad = (id: SecretIdentity) => JSON.stringify(['clavifer', 1, id.ownerId, id.secretId, id.version]);
 // The archive identity has four elements where a secret version has five, so neither envelope opens as the other.
 const archiveAad = (ownerId: string) => JSON.stringify(['clavifer', 1, ownerId, 'archive-identity']);
+// A token derived from a secret has six. It names no version: a rotation of the secret carries the
+// cached tokens of its other recipes over to the new version.
+export type TokenIdentity = { ownerId: string; secretId: string; recipe: string };
+const tokenAad = (id: TokenIdentity) =>
+  JSON.stringify(['clavifer', 1, id.ownerId, 'derived-token', id.secretId, id.recipe]);
 /** Encrypts with the current root key; kekId records its id. */
 async function sealEnvelope(ring: RootKey[], aad: string, plaintext: string): Promise<Envelope> {
   const { id: kekId, key } = ring[0];
@@ -129,3 +148,8 @@ export const encryptArchiveIdentity = (ring: RootKey[], ownerId: string, identit
   sealEnvelope(ring, archiveAad(ownerId), identity);
 export const decryptArchiveIdentity = (ring: RootKey[], ownerId: string, envelope: Envelope) =>
   openEnvelope(ring, archiveAad(ownerId), envelope);
+/** A cached token derived from a secret, in the envelope of a secret. */
+export const encryptToken = (ring: RootKey[], id: TokenIdentity, token: string) =>
+  sealEnvelope(ring, tokenAad(id), token);
+export const decryptToken = (ring: RootKey[], id: TokenIdentity, envelope: Envelope) =>
+  openEnvelope(ring, tokenAad(id), envelope);

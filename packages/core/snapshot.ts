@@ -1,7 +1,9 @@
 /**
- * The snapshot format "clavifer-backup-v1". This comment is the normative specification and the
- * schemas below implement it. v1 is frozen: files in it are read by every later version, so its
- * meaning never changes; a change of the format is a new version (v2) with a conversion from v1.
+ * The snapshot format "clavifer-backup-v2". This comment is the normative specification and the
+ * schemas below implement it, together with those of "clavifer-backup-v1", the format before it, whose
+ * two differences from v2 the section "v1" at the end lists. A format is frozen once released: files
+ * in it are read by every later version, so its meaning never changes; a change of the format is a new
+ * version (v3) with a conversion from the earlier ones. Writers write v2 only.
  * The module is shared by the Worker and the console, so it imports nothing platform-specific.
  *
  * A snapshot is a logical export, not a copy of the tables: the dozens of internal columns of the
@@ -23,7 +25,9 @@
  *   LF. The bounds on single rows guarantee these: a D1 row is at most 2 MB, an access request at most
  *   256 KiB, a sealed segment about 1 MB.
  * - The format is closed: an unknown record type or an unknown field is rejected. Every field is
- *   present; a nullable field (marked ? below) is written as null when it has no value.
+ *   present; a nullable field (marked ? below) is written as null when it has no value. The one
+ *   exception is the members of connection.auth marked ~ below, which are absent when not set: auth is
+ *   carried as the connection stores it, where an absent member takes its default.
  * - Records come in this normative order: header, owner, settings, archive-identity (optional), every
  *   secret, every secret-version, every connection, every installation, every grant, every
  *   access-request, every audit, every segment, end. owner follows header, so an importer has the
@@ -32,7 +36,7 @@
  * - Times are integers, UTC milliseconds since the epoch. Ids are strings, kept as stored.
  *
  * Records. Every record carries "type", its record type, and these fields:
- * - header: format "clavifer-backup-v1"; kind "automatic" or "full"; createdAt, the time of the one
+ * - header: format "clavifer-backup-v2"; kind "automatic" or "full"; createdAt, the time of the one
  *   consistent read the snapshot was taken from; source {origin, rpId, version}: the exporting
  *   instance's origin, its WebAuthn RP id (the hostname of the origin) and the service version.
  * - owner: id, email (lowercase), name, emailVerified (boolean), image?, createdAt, updatedAt,
@@ -61,11 +65,32 @@
  *   updatedAt.
  *   - auth: one of {type: "none"}, {type: "bearer", secretId, field}, {type: "header", secretId,
  *     field, name}, {type: "basic", secretId, usernameField, passwordField}, {type: "query", secretId,
- *     field, name}.
+ *     field, name}, and the four kinds that derive a credential (the type Auth of packages/core/auth.ts,
+ *     where their meaning is given):
+ *     - {type: "jwt", secretId, jwt, header~, scheme~}: a JWT signed for every request.
+ *     - {type: "oauth-client", secretId, client (not "none"), grantType~, scope~, ...exchange}.
+ *     - {type: "oauth-jwt", secretId, jwt, client~ ("basic" or "post"), ...exchange}.
+ *     - {type: "oauth-refresh", secretId, refreshField, client, scope~, authorize~, ...exchange}, where
+ *       authorize is {url, scope~, params~}.
+ *     exchange is the members tokenUrl, bodyFormat~ ("form" or "json"), params~, ttl~ (a positive
+ *     integer), header~, scheme~. header is a header name and scheme a string ("" for none). params
+ *     is an object from name to string. jwt is {alg, keyField, keyEncoding~, header~, claims, lifetime
+ *     (a positive integer), jti~ (a boolean)}: alg one of RS256, RS384, RS512, PS256, PS384, PS512,
+ *     ES256, ES384, ES512, EdDSA, Ed25519, HS256, HS384, HS512; keyEncoding one of "utf8", "base64",
+ *     "base64url", "hex"; header an object from name to a string or a reference; claims an object from
+ *     name to a reference or any other JSON value nested at most 32 levels deep, where a value that is
+ *     an object with a member "$field" is a reference and nothing else. client is one of {method "basic" or "post", id, secretField}, {method
+ *     "jwt", id~, jwt}, {method "none", id~}, where id is a string or a reference. A reference is
+ *     {"$field": name}, the value of that field of the credential, where name matches
+ *     ^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$ as every field name of a credential does. The other field names
+ *     (field, usernameField, passwordField, keyField, refreshField, secretField) are non-empty strings.
  *   - policy: the full normalized shape {paths, methods, deny, approval, free, hosts, anyHost}.
  *     paths and methods are non-empty; deny, approval, free and hosts are arrays (the rules as stored,
  *     "METHOD /path"); anyHost is a boolean. Writers fill keys an older stored policy lacks with their
- *     defaults: methods ["GET", "HEAD"], empty lists, anyHost false.
+ *     defaults: methods ["GET", "HEAD"], empty lists, anyHost false. The path of a rule is in the syntax
+ *     of parseRule in packages/core/proxy.ts: a segment may be {name} with literal text around it (one
+ *     segment), ** (any number of segments) or, last, * (the old trailing wildcard); a literal "{" or
+ *     "}" is written %7B or %7D.
  * - installation: clientId, name?, applicationType? ("native" or "web"), redirectUris (an array of
  *   strings), scopes? and grantTypes? (arrays of strings; null where the database holds NULL, written
  *   back as they are on import), disabled (boolean; NULL in the database means false, as some
@@ -99,12 +124,34 @@
  * access and refresh tokens, device codes, signing keys (jwks), rate limits, verifications, OAuth
  * consents, oauthResource and oauthClientResource rows (rebuilt for the origin), setup tokens, import
  * records, backup bookkeeping other than the recipient, secret_versions.id (regenerated on import) and
- * the manifest's own timestamps (a segment's seal time is segment.createdAt). An importer writes every
- * installation with the Owner as its user, tokenEndpointAuthMethod "none" and no client secret.
+ * the manifest's own timestamps (a segment's seal time is segment.createdAt); nor the tokens derived
+ * from credentials, the locks of their exchanges and the authorizations in progress (token_cache,
+ * token_locks, oauth_flows): an imported instance derives its tokens anew. A refresh token that was
+ * rotated or authorized is an ordinary secret-version. An importer writes every installation with the
+ * Owner as its user, tokenEndpointAuthMethod "none" and no client secret.
+ *
+ * References. Every active credential has exactly its versions 1 to currentVersion; every active
+ * connection other than "none" names an active credential whose current version holds every field its
+ * auth reads (authFields in packages/core/auth.ts), except the refresh token of an "oauth-refresh"
+ * with authorize, which the Owner may not have authorized yet; every grant and access request names an
+ * installation of the file and every grant a resource of the file.
  *
  * Versions: an importer accepts its own format and earlier ones and rejects later ones. The segment
  * format "clavifer-archive-v1" is always accepted. A closed format is deliberate: a reader that
  * ignored unknown fields would silently drop data when an older version imports a newer file.
+ *
+ * v1 ("clavifer-backup-v1", written by 0.5.0) is everything above but in two places:
+ * 1. header.format is "clavifer-backup-v1", and auth is one of {type: "none"}, {type: "bearer",
+ *    secretId, field}, {type: "header", secretId, field, name}, {type: "basic", secretId,
+ *    usernameField, passwordField}, {type: "query", secretId, field, name}.
+ * 2. A rule (deny, approval, free) is "METHOD /path" where "{" and "}" are literal characters and *
+ *    occurs only as the last segment.
+ * A v1 file converts to v2 record by record as it is, but that a rule with a literal "{" or "}" would
+ * become a wildcard: an importer refuses such a file (backup_has_unconvertible_rule) when the rule is
+ * one of a connection, or of a setup draft's connections or an update draft's changes in an access
+ * request still pending and unexpired at the import (the Owner may yet approve it, and its tests ran
+ * under the literal reading), as migration 0002 refuses one in place. %7B and %7D in a v1 rule are
+ * literal in both formats.
  *
  * Segment files ("clavifer-archive-v1"), age-encrypted to the archive identity, follow the same file
  * grammar. The first line is {"type": "header", "format": "clavifer-archive-v1", kind, seq, first,
@@ -113,8 +160,14 @@
  */
 import { z } from 'zod';
 import { Fault, assert } from './errors';
+import { claim, ref, requiredFields, type Auth } from './auth';
+import { JWT_ALGS, KEY_ENCODINGS } from './jwt';
 
-export const SNAPSHOT_FORMAT = 'clavifer-backup-v1';
+/** The format writers write. */
+export const SNAPSHOT_FORMAT = 'clavifer-backup-v2';
+/** The formats this version reads, oldest first. */
+export const SNAPSHOT_FORMATS = ['clavifer-backup-v1', SNAPSHOT_FORMAT] as const;
+export type SnapshotFormat = (typeof SNAPSHOT_FORMATS)[number];
 export const ARCHIVE_FORMAT = 'clavifer-archive-v1';
 const MiB = 1024 * 1024;
 export const LINE_LIMIT = 4 * MiB;
@@ -132,13 +185,14 @@ const bound = z.tuple([time, id]);
 const seq = z.int().nonnegative().max(9_999_999_999);
 const rows = z.int().positive();
 
-const header = z.strictObject({
-  type: z.literal('header'),
-  format: z.literal(SNAPSHOT_FORMAT),
-  kind: z.enum(['automatic', 'full']),
-  createdAt: time,
-  source: z.strictObject({ origin: z.string(), rpId: z.string(), version: z.string() }),
-});
+const header = <F extends SnapshotFormat>(format: F) =>
+  z.strictObject({
+    type: z.literal('header'),
+    format: z.literal(format),
+    kind: z.enum(['automatic', 'full']),
+    createdAt: time,
+    source: z.strictObject({ origin: z.string(), rpId: z.string(), version: z.string() }),
+  });
 const password = z
   .strictObject({
     algorithm: z.literal('scrypt'),
@@ -200,13 +254,70 @@ const secretVersion = z.strictObject({
   createdAt: time,
 });
 const field = z.string().min(1);
-const auth = z.discriminatedUnion('type', [
+const authV1 = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('none') }),
   z.strictObject({ type: z.literal('bearer'), secretId: id, field }),
   z.strictObject({ type: z.literal('header'), secretId: id, field, name: z.string().min(1) }),
   z.strictObject({ type: z.literal('basic'), secretId: id, usernameField: field, passwordField: field }),
   z.strictObject({ type: z.literal('query'), secretId: id, field, name: z.string().min(1) }),
 ]);
+// The members of the kinds that derive a credential, by structure only: what an instance accepts when a
+// connection is saved (connectionInput in apps/worker/src/vault.ts) is a business rule of its version.
+// A reference and a claim are what vault.ts takes, the bound on a claim's depth included, since reading
+// a deeper one (its recipe, the JSON of its row) would run out of stack.
+const params = z.record(z.string(), z.string());
+const present = { header: z.string().min(1).optional(), scheme: z.string().optional() };
+const jwt = z.strictObject({
+  alg: z.enum(JWT_ALGS),
+  keyField: field,
+  keyEncoding: z.enum(KEY_ENCODINGS).optional(),
+  header: z.record(z.string(), z.union([z.string(), ref])).optional(),
+  claims: z.record(z.string(), claim),
+  lifetime: z.int().positive(),
+  jti: z.boolean().optional(),
+});
+const clientId = z.union([z.string(), ref]);
+const secretClient = z.strictObject({ method: z.enum(['basic', 'post']), id: clientId, secretField: field });
+const jwtClient = z.strictObject({ method: z.literal('jwt'), id: clientId.optional(), jwt });
+const publicClient = z.strictObject({ method: z.literal('none'), id: clientId.optional() });
+const exchange = {
+  ...present,
+  tokenUrl: z.string(),
+  bodyFormat: z.enum(['form', 'json']).optional(),
+  params: params.optional(),
+  ttl: z.int().positive().optional(),
+};
+const authV2 = z.discriminatedUnion('type', [
+  ...authV1.options,
+  z.strictObject({ type: z.literal('jwt'), secretId: id, jwt, ...present }),
+  z.strictObject({
+    type: z.literal('oauth-client'),
+    secretId: id,
+    client: z.discriminatedUnion('method', [secretClient, jwtClient]),
+    grantType: z.string().optional(),
+    scope: z.string().optional(),
+    ...exchange,
+  }),
+  z.strictObject({ type: z.literal('oauth-jwt'), secretId: id, jwt, client: secretClient.optional(), ...exchange }),
+  z.strictObject({
+    type: z.literal('oauth-refresh'),
+    secretId: id,
+    refreshField: field,
+    client: z.discriminatedUnion('method', [secretClient, jwtClient, publicClient]),
+    scope: z.string().optional(),
+    authorize: z.strictObject({ url: z.string(), scope: z.string().optional(), params: params.optional() }).optional(),
+    ...exchange,
+  }),
+]);
+// v2 carries exactly the Auth that connections store: a change to Auth fails here, and is a new format.
+// Compared as they are, a member required on one side and optional on the other shows; with every member
+// made required (claims, any JSON, as they are), an optional member one side lacks.
+type Mutual<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+type Whole<T> = T extends object ? { [K in keyof T]-?: K extends 'claims' ? T[K] : Whole<T[K]> } : T;
+const carriesAuth: [Mutual<z.infer<typeof authV2>, Auth>, Mutual<Whole<z.infer<typeof authV2>>, Whole<Auth>>] = [
+  true,
+  true,
+];
 const policy = z.strictObject({
   paths: strings.min(1),
   methods: z.array(method).min(1),
@@ -216,18 +327,19 @@ const policy = z.strictObject({
   hosts: strings,
   anyHost: z.boolean(),
 });
-const connection = z.strictObject({
-  type: z.literal('connection'),
-  id,
-  name: z.string(),
-  origin: z.string(),
-  description: z.string(),
-  auth,
-  policy,
-  status: z.enum(['active', 'deleted']),
-  createdAt: time,
-  updatedAt: time,
-});
+const connection = <A extends typeof authV1 | typeof authV2>(auth: A) =>
+  z.strictObject({
+    type: z.literal('connection'),
+    id,
+    name: z.string(),
+    origin: z.string(),
+    description: z.string(),
+    auth,
+    policy,
+    status: z.enum(['active', 'deleted']),
+    createdAt: time,
+    updatedAt: time,
+  });
 const installation = z.strictObject({
   type: z.literal('installation'),
   clientId: id,
@@ -336,21 +448,28 @@ const end = z.strictObject({
     segment: count,
   }),
 });
-export const snapshotRecord = z.discriminatedUnion('type', [
-  header,
-  owner,
-  settings,
-  archiveIdentity,
-  secret,
-  secretVersion,
-  connection,
-  installation,
-  grant,
-  accessRequest,
-  audit,
-  segment,
-  end,
-]);
+const records = <F extends SnapshotFormat, A extends typeof authV1 | typeof authV2>(format: F, auth: A) =>
+  z.discriminatedUnion('type', [
+    header(format),
+    owner,
+    settings,
+    archiveIdentity,
+    secret,
+    secretVersion,
+    connection(auth),
+    installation,
+    grant,
+    accessRequest,
+    audit,
+    segment,
+    end,
+  ]);
+const RECORDS = {
+  'clavifer-backup-v1': records('clavifer-backup-v1', authV1),
+  'clavifer-backup-v2': records('clavifer-backup-v2', authV2),
+};
+/** A record of the format writers write. */
+export const snapshotRecord = RECORDS[SNAPSHOT_FORMAT];
 export const archiveHeader = z.strictObject({
   type: z.literal('header'),
   format: z.literal(ARCHIVE_FORMAT),
@@ -361,7 +480,8 @@ export const archiveHeader = z.strictObject({
   rows,
   createdAt: time,
 });
-export type SnapshotRecord = z.infer<typeof snapshotRecord>;
+/** A record of any format this version reads. */
+export type SnapshotRecord = z.infer<(typeof RECORDS)[SnapshotFormat]>;
 export type RecordOf<T extends SnapshotRecord['type']> = Extract<SnapshotRecord, { type: T }>;
 export type ArchiveHeader = z.infer<typeof archiveHeader>;
 
@@ -372,6 +492,54 @@ const issues = (e: z.ZodError) =>
     .map((issue) => `${issue.path.join('.') || 'record'}: ${issue.message}`)
     .join('; ');
 const lineLimit = (type: unknown) => (type === 'segment' ? SEGMENT_LINE_LIMIT : LINE_LIMIT);
+
+/** The format the first record of a snapshot names, when this version reads it. A header of another
+ * format comes from a later version; a first record that is no header is left to the schema and the
+ * order to refuse. */
+export function snapshotFormat(first: unknown): SnapshotFormat {
+  const { type, format } = (first ?? {}) as { type?: unknown; format?: unknown };
+  if (SNAPSHOT_FORMATS.some((f) => f === format)) return format as SnapshotFormat;
+  if (type === 'header' && typeof format === 'string') throw newer(format);
+  return SNAPSHOT_FORMAT;
+}
+const newer = (format: string) =>
+  new Fault(
+    'snapshot_from_newer_version',
+    400,
+    `the snapshot is in the format ${JSON.stringify(format)}, which a later version writes; this one reads ${SNAPSHOT_FORMATS.join(' and ')}`,
+  );
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+/** The rule lists of a record that may yet apply its rules, where migration 0002 looks for them in place:
+ * a connection's policy, and the connections of a setup draft and the changes of an update draft still
+ * waiting for the Owner, whose tests ran under the reading of their version. */
+function ruleLists(record: SnapshotRecord): Record<string, unknown>[] {
+  if (record.type === 'connection') return [record.policy];
+  if (record.type !== 'access-request' || record.status !== 'pending' || record.expiresAt <= Date.now()) return [];
+  const { setup, update } = record.requested;
+  const connections = isObject(setup) && Array.isArray(setup.connections) ? setup.connections : [];
+  return [...connections, isObject(update) && update.changes].filter(isObject);
+}
+/** A record of a snapshot in format, checked against that format's schema, as this version holds it;
+ * what names the record in a refusal. A v1 record holds in v2 as it is, but a rule with a literal "{"
+ * or "}", which v2 reads as a wildcard. format is the one an import recorded, which a later version this
+ * one was rolled back from may have written. */
+export function parseRecord(format: string, value: unknown, what: string): SnapshotRecord {
+  if (!SNAPSHOT_FORMATS.some((f) => f === format)) throw newer(format);
+  const parsed = RECORDS[format as SnapshotFormat].safeParse(value);
+  if (!parsed.success) throw invalid(`${what}: ${issues(parsed.error)}`);
+  const record = parsed.data;
+  if (format === 'clavifer-backup-v1')
+    for (const list of ruleLists(record))
+      for (const kind of ['deny', 'approval', 'free'] as const)
+        for (const rule of Array.isArray(list[kind]) ? list[kind] : [])
+          assert(
+            typeof rule !== 'string' || !/[{}]/.test(rule),
+            'backup_has_unconvertible_rule',
+            409,
+            `${what}: the ${kind} rule ${JSON.stringify(rule)} of ${record.type} ${(record as { id: string }).id} has a literal "{" or "}", which this version reads as a wildcard`,
+          );
+  return record;
+}
 
 const encoder = new TextEncoder();
 /** One record as its line: JSON with U+2028, U+2029 and U+0085 escaped, terminated by LF, in UTF-8.
@@ -452,10 +620,12 @@ export async function* readRecords(stream: ReadableStream<Uint8Array>): AsyncGen
 }
 
 const SINGLE = new Set<string>(['header', 'owner', 'settings', 'archive-identity', 'end']);
-/** Checks a snapshot record by record, in file order: each against its schema, the normative order, a
- * segment's key or data against header.kind, and at the end the counts against end.counts. push
- * returns the parsed record; finish confirms that the end record came. */
+/** Checks a snapshot record by record, in file order: each against the schema of the format its header
+ * names (see parseRecord), the normative order, a segment's key or data against header.kind, and at the
+ * end the counts against end.counts. push returns the parsed record; finish confirms that the end record
+ * came. */
 export class SnapshotValidator {
+  private format: SnapshotFormat = SNAPSHOT_FORMAT;
   private kind: RecordOf<'header'>['kind'] | null = null;
   private position = -1;
   private line = 0;
@@ -468,9 +638,8 @@ export class SnapshotValidator {
     this.line++;
     const fail = (message: string) => invalid(`line ${this.line}: ${message}`);
     if (this.ended) throw fail('a record after end');
-    const parsed = snapshotRecord.safeParse(value);
-    if (!parsed.success) throw fail(issues(parsed.error));
-    const record = parsed.data;
+    if (this.position === -1) this.format = snapshotFormat(value);
+    const record = parseRecord(this.format, value, `line ${this.line}`);
     const at = RECORD_TYPES.indexOf(record.type);
     // header, owner and settings open the file in this order; after them a type may repeat its
     // predecessor unless it occurs once, and never goes back.
@@ -507,9 +676,10 @@ export class SnapshotValidator {
   }
 }
 
-/** What a snapshot needs besides its structure to be imported: every active credential has all its
- * versions, every active connection's credential exists with the fields it injects, every grant and
- * access request names an installation of the file and every grant a resource of the file. */
+/** What a snapshot needs besides its structure to be imported (References above): every active
+ * credential has all its versions, every active connection's credential exists with the fields it
+ * requires, every grant and access request names an installation of the file and every grant a
+ * resource of the file. */
 export function checkReferences(records: SnapshotRecord[]) {
   const of = <T extends SnapshotRecord['type']>(type: T) => records.filter((r): r is RecordOf<T> => r.type === type);
   const held = new Map<string, RecordOf<'secret-version'>[]>();
@@ -529,9 +699,8 @@ export function checkReferences(records: SnapshotRecord[]) {
   for (const c of of('connection')) {
     if (c.status !== 'active' || c.auth.type === 'none') continue;
     const values = current.get(c.auth.secretId);
-    const fields = c.auth.type === 'basic' ? [c.auth.usernameField, c.auth.passwordField] : [c.auth.field];
     assert(
-      values && fields.every((field) => Object.hasOwn(values, field)),
+      values && requiredFields(c.auth).every((field) => Object.hasOwn(values, field)),
       'backup_has_broken_connection',
       409,
       `connection ${c.id}`,

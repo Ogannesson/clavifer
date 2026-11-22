@@ -1,11 +1,21 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Miniflare, convertV4MiniflareOptions, Log, LogLevel } from 'miniflare';
 import { applyMigrations } from '../scripts/migrations.mjs';
-import { canonicalPath, checkPath, matchHost, matchRule, parseRule, targetUrl } from '../packages/core/proxy';
+import {
+  METHODS,
+  appendQuery,
+  canonicalPath,
+  checkPath,
+  matchHost,
+  matchRule,
+  parseRule,
+  targetUrl,
+} from '../packages/core/proxy';
 import {
   accessRequest,
   accessStatus,
   connectionInput,
+  decide,
   invoke,
   invokeInput,
   metadata,
@@ -64,7 +74,7 @@ describe('connection rules', () => {
     expect(checkPath('/x/a%2Fb', ['/x'])).toBe(true);
     expect(checkPath('/x/a%2Fb/c', ['/x/a%2fb'])).toBe(true);
     expect(matchRule(['DELETE /x/*'], 'DELETE', canonicalPath('/x/a%2Fb'))).toBe(true);
-    expect(parseRule('DELETE /x/a%2Fb').path).toBe('/x/a/b');
+    expect(parseRule('DELETE /x/a%2Fb').segments).toEqual(['x', 'a', 'b']);
   });
 
   // Decoding only splits a segment, so every spelling of a denied resource still meets the rule.
@@ -94,7 +104,7 @@ describe('connection rules', () => {
   });
 
   it('compares decoded paths, matching an encoded rule or request against its plain form', () => {
-    expect(parseRule('GET /v1/%61').path).toBe('/v1/a');
+    expect(parseRule('GET /v1/%61').segments).toEqual(['v1', 'a']);
     expect(matchRule(['DELETE /v1/%61/*'], 'DELETE', canonicalPath('/v1/a/%62'))).toBe(true);
     expect(matchRule(['DELETE /v1/a/*'], 'DELETE', canonicalPath('/v1/%61'))).toBe(true);
   });
@@ -114,6 +124,32 @@ describe('connection rules', () => {
     'GET /v1;x',
     'GET /v1/%E2%80%AE',
     'GET /' + 'a'.repeat(320),
+    // Wildcards: * only as the last segment, ** only as a whole segment, one {name} per segment.
+    'GET /v1/*/items/*',
+    'GET /v1/a*',
+    'GET /v1/a**',
+    'GET /v1/***',
+    'GET /v1/**x/b',
+    'GET /v1/{x}*',
+    'GET /v1/{a}{b}',
+    'GET /v1/{a}-{b}',
+    'GET /v1/{x',
+    'GET /v1/x}',
+    'GET /v1/}x{',
+    'GET /v1/{{x}}',
+    'GET /v1/{x-y}',
+    'GET /v1/{x.y}',
+    'GET /v1/{ü}',
+    // An encoded slash around a {name} would put a segment boundary inside it.
+    'GET /v1/a%2F{x}',
+    'GET /v1/{x}%2Fb',
+    // A wildcard cannot complete a percent-encoding or a multi-byte character.
+    'GET /v1/%{x}',
+    'GET /v1/%4{x}',
+    'GET /v1/%E2{x}%84%AA',
+    'GET /v1/{x}/../b',
+    'GET /v1/**//b',
+    'GET /v1/{x};y',
   ])('rejects the malformed rule %j', (text) => {
     expect(() => parseRule(text)).toThrow('invalid_rule');
   });
@@ -138,6 +174,259 @@ describe('connection rules', () => {
       expect.objectContaining({ code: 'too_many_rules', message: 'approval' }),
     );
     expect(saved({ approval: Array(50).fill('GET /v1') }).approval).toHaveLength(50);
+  });
+});
+
+describe('rule wildcards', () => {
+  // The rules of the GCP table in the design. Every one is a deny or approval rule, matching when
+  // either reading does, except R7, a free rule, which with its wildcards must match both.
+  const table: [string, string, boolean][] = [
+    ['R1', 'POST /v1/projects/{p}/serviceAccounts/{sa}/keys', false],
+    ['R2', '* /**/{r}:setIamPolicy', false],
+    ['R3', '* /**/setIamPolicy', false],
+    ['R4', 'PUT /storage/v1/b/**/iam', false],
+    ['R5', '* /v1/projects/{p}/serviceAccounts/{sa}:generateAccessToken', false],
+    ['R6', '* /batch/*', false],
+    ['R7', 'GET /compute/v1/projects/{p}/zones/{z}/instances/{i}', true],
+    ['R8', '* /v2/policies/*', false],
+    ['R9', 'DELETE /api/v4/projects/{id}', false],
+    ['R10', 'GET /v1/items/*', false],
+  ];
+  const hits = (method: string, raw: string) =>
+    table.filter(([, rule, free]) => matchRule([rule], method, canonicalPath(raw), raw, free)).map(([name]) => name);
+
+  it.each([
+    [1, 'POST', '/v1/projects/p/serviceAccounts/sa@p.iam.gserviceaccount.com/keys', ['R1']],
+    [2, 'POST', '/v1/projects/-/serviceAccounts/sa%40p.iam.gserviceaccount.com/keys', ['R1']],
+    [3, 'GET', '/v1/projects/-/serviceAccounts/sa%40p.iam.gserviceaccount.com/keys', []],
+    [4, 'POST', '/v1/projects/p/serviceAccounts/sa/keys:upload', []],
+    [5, 'POST', '/v3/projects/p:setIamPolicy', ['R2']],
+    [6, 'POST', '/v3/projects/p%3AsetIamPolicy', ['R2']],
+    [7, 'POST', '/v3/projects/p:SETIAMPOLICY', ['R2']],
+    [8, 'POST', '/v3/projects/p:setIamPolicy/', ['R2']],
+    [9, 'POST', '/v1/projects/p/locations/l/keyRings/k/cryptoKeys/c:setIamPolicy', ['R2']],
+    [10, 'POST', '/v3/projects/p:getIamPolicy', []],
+    [11, 'POST', '/compute/v1/projects/p/zones/z/instances/i/setIamPolicy', ['R3']],
+    [12, 'POST', '/compute/v1/locations/global/firewallPolicies/f/setIamPolicy', ['R3']],
+    [13, 'PUT', '/storage/v1/b/bkt/iam', ['R4']],
+    [14, 'GET', '/storage/v1/b/bkt/iam', []],
+    [15, 'PUT', '/storage/v1/b/bkt/o/dir%2Ffile/iam', ['R4']],
+    [16, 'POST', '/v1/projects/-/serviceAccounts/x:generateAccessToken', ['R5']],
+    [17, 'POST', '/v1/projects/-/serviceAccounts/x:signJwt', []],
+    [18, 'POST', '/batch', ['R6']],
+    [18, 'POST', '/batch/compute/v1', ['R6']],
+    [19, 'GET', '/compute/v1/projects/p/zones/z/instances/i', ['R7']],
+    [20, 'GET', '/compute/v1/projects/p/zones/z/instances/i/serialPort', []],
+    [21, 'GET', '/compute/v1/projects/p/zones/z/instances/i%2FserialPort', []],
+    [22, 'POST', '/v2/policies/cloudresourcemanager.googleapis.com%2Fprojects%2Fp/denypolicies', ['R8']],
+    [23, 'DELETE', '/api/v4/projects/group%2Fproject', ['R9']],
+    [24, 'DELETE', '/api/v4/projects/group%2Fproject/issues/1', []],
+    [25, 'GET', '/v1/items', ['R10']],
+    [25, 'GET', '/v1/items/a/b', ['R10']],
+  ])('row %i: %s %s hits %j', (_row, method, path, expected) => {
+    expect(hits(method, path)).toEqual(expected);
+  });
+
+  it('lets either reading of an encoded slash hit a deny or approval rule, and a free rule with wildcards only both', () => {
+    // Row 23: the decoded reading has one segment too many; the raw one keeps the GitLab id whole.
+    const gitlab = '/api/v4/projects/group%2Fproject';
+    expect(matchRule(['DELETE /api/v4/projects/{id}'], 'DELETE', canonicalPath(gitlab))).toBe(false);
+    expect(matchRule(['DELETE /api/v4/projects/{id}'], 'DELETE', canonicalPath(gitlab), gitlab)).toBe(true);
+    // Row 21: read as sent, {i} would take "i/serialPort"; read decoded, the path has a segment more.
+    const serial = '/compute/v1/projects/p/zones/z/instances/i%2FserialPort';
+    const r7 = 'GET /compute/v1/projects/{p}/zones/{z}/instances/{i}';
+    expect(matchRule([r7], 'GET', canonicalPath(serial), serial)).toBe(true);
+    expect(matchRule([r7], 'GET', canonicalPath(serial), serial, true)).toBe(false);
+    const policy = {
+      paths: ['/'],
+      methods: [...METHODS],
+      deny: ['* /batch/*'],
+      approval: ['DELETE /api/v4/projects/{id}', 'PUT /storage/v1/b/**/iam'],
+      free: [r7],
+    };
+    expect(decide(policy, 'DELETE', gitlab, null)).toEqual({ code: 'approval_required' });
+    expect(decide({ ...policy, deny: policy.approval }, 'DELETE', gitlab, null)).toEqual({
+      code: 'path_denied',
+      rule: 'DELETE /api/v4/projects/{id}',
+    });
+    expect(decide(policy, 'PUT', '/storage/v1/b/bkt/o/dir%2Ffile/iam', null).code).toBe('approval_required');
+    expect(decide(policy, 'GET', serial, null).code).toBe('grant_required');
+    expect(decide(policy, 'GET', '/compute/v1/projects/p/zones/z/instances/i', null).code).toBe('run');
+    expect(decide(policy, 'POST', '/batch%2Fcompute', null)).toEqual({ code: 'path_denied', rule: '* /batch/*' });
+  });
+
+  const open = { paths: ['/'], methods: [...METHODS] };
+  it('runs nothing on a free rule with {name} that the upstream routes to another endpoint', () => {
+    // GitLab reads "grp%2Fissues" as one project id: decoded the request has the rule's six segments,
+    // as sent it is GET /projects/:id/variables, the CI/CD variables of project grp/issues.
+    const policy = { ...open, free: ['GET /api/v4/projects/{id}/issues/{iid}'] };
+    expect(decide(policy, 'GET', '/api/v4/projects/1/issues/2', null).code).toBe('run');
+    expect(decide(policy, 'GET', '/api/v4/projects/grp%2Fissues/2', null).code).toBe('grant_required');
+    expect(decide(policy, 'GET', '/api/v4/projects/grp%2Fissues/variables', null).code).toBe('grant_required');
+  });
+
+  it('runs nothing on a free rule with ** whose raw reading leaves the rule', () => {
+    const policy = { ...open, free: ['GET /a/**/b'] };
+    expect(decide(policy, 'GET', '/a/x/b', null).code).toBe('run');
+    expect(decide(policy, 'GET', '/a/x%2Fy/b', null).code).toBe('run');
+    expect(decide(policy, 'GET', '/a/x%2Fb', null).code).toBe('grant_required');
+  });
+
+  it('keeps a free rule without {name} or ** reading the decoded path only, as before', () => {
+    expect(decide({ ...open, free: ['GET /x/a/b'] }, 'GET', '/x/a%2Fb', null).code).toBe('run');
+    expect(decide({ ...open, free: ['GET /x/a/*'] }, 'GET', '/x/a%2Fb/c', null).code).toBe('run');
+    expect(decide({ ...open, free: ['GET /x/a%2Fb'] }, 'GET', '/x/a/b', null).code).toBe('run');
+  });
+
+  it('lets {name} take any characters of one segment, none included, around a literal prefix and suffix', () => {
+    const match = (rule: string, path: string) => matchRule([rule], 'GET', canonicalPath(path), path);
+    expect(match('GET /v{n}/items', '/v1/items')).toBe(true);
+    expect(match('GET /v{n}/items', '/v/items')).toBe(true);
+    expect(match('GET /v{n}/items', '/x1/items')).toBe(false);
+    expect(match('GET /files/{name}.json', '/files/a.b.json')).toBe(true);
+    expect(match('GET /files/{name}.json', '/files/.json')).toBe(true);
+    expect(match('GET /files/{name}.json', '/files/a.json/x')).toBe(false);
+    expect(match('GET /files/{}', '/files/x')).toBe(true);
+    expect(match('GET /files/{}', '/files')).toBe(false);
+    expect(match('GET /files/{}', '/files/')).toBe(false);
+    // Prefix and suffix must not overlap: "ab" is not "ab" + anything + "b".
+    expect(match('GET /{x}', '/ab')).toBe(true);
+    expect(match('GET /ab{x}b', '/ab')).toBe(false);
+    expect(match('GET /ab{x}b', '/abb')).toBe(true);
+    // Percent-encoded wildcard characters are literal, as an encoded * always was.
+    expect(match('GET /a/%7Bx%7D', '/a/%7Bx%7D')).toBe(true);
+    expect(match('GET /a/%7Bx%7D', '/a/y')).toBe(false);
+    expect(match('GET /a/%2A', '/a/%2A')).toBe(true);
+    expect(match('GET /a/%2A', '/a/b')).toBe(false);
+  });
+
+  it('lets ** take any number of segments, none included, wherever and however often it stands', () => {
+    const match = (rule: string, path: string) => matchRule([rule], 'GET', canonicalPath(path), path);
+    expect(match('GET /**', '/')).toBe(true);
+    expect(match('GET /**', '/a/b')).toBe(true);
+    expect(match('GET /a/**', '/a')).toBe(true);
+    expect(match('GET /a/**/', '/a/b/')).toBe(true);
+    expect(match('GET /**/b/**/c', '/b/c')).toBe(true);
+    expect(match('GET /**/b/**/c', '/x/b/y/z/c')).toBe(true);
+    expect(match('GET /**/b/**/c', '/b/b/c/c')).toBe(true);
+    expect(match('GET /**/b/**/c', '/c/b')).toBe(false);
+    expect(match('GET /**/b/**/c', '/b/c/d')).toBe(false);
+    expect(match('GET /**/b/**/c/**', '/b/c/d')).toBe(true);
+    expect(match('GET /**/**/b', '/b')).toBe(true);
+    expect(match('GET /a/**/{x}:run/**/z', '/a/q/j:run/z')).toBe(true);
+    expect(match('GET /a/**/{x}:run/**/z', '/a/q/j:walk/z')).toBe(false);
+    // The older trailing /* is a trailing /**, its own path included.
+    expect(match('GET /a/*', '/a')).toBe(true);
+    expect(match('GET /a/**/*', '/a')).toBe(true);
+  });
+
+  // The implementation before wildcards. A rule without {, } or ** must parse and match as it did.
+  function legacyParseRule(text: string, implicitMethod?: string) {
+    const check = (ok: unknown) => {
+      if (!ok) throw new Error('invalid_rule');
+    };
+    const parts = text.trim().split(/\s+/);
+    check(text.length <= 320 && (parts.length === 2 || (parts.length === 1 && implicitMethod)));
+    const method = parts.length === 2 ? parts[0].toUpperCase() : implicitMethod!;
+    const raw = parts[parts.length - 1];
+    check(method === '*' || (METHODS as readonly string[]).includes(method));
+    const prefix = raw.endsWith('/*');
+    const path = prefix ? raw.slice(0, -2) || '/' : raw;
+    check(path.startsWith('/') && !path.includes('*'));
+    let decoded: string;
+    try {
+      decoded = canonicalPath(path);
+    } catch {
+      throw new Error('invalid_rule');
+    }
+    return { text: `${method} ${raw}`, method, path: legacyFold(decoded), prefix };
+  }
+  const legacyFold = (path: string) => path.replace(/[A-Z]/g, (c) => c.toLowerCase()).replace(/(.)\/$/, '$1');
+  function legacyMatchRule(rules: string[], method: string, path: string) {
+    const target = legacyFold(path);
+    return rules.some((text) => {
+      const rule = legacyParseRule(text);
+      if (rule.method !== '*' && rule.method !== method && !(rule.method === 'GET' && method === 'HEAD')) return false;
+      return target === rule.path || (rule.prefix && (rule.path === '/' || target.startsWith(rule.path + '/')));
+    });
+  }
+
+  it('parses and matches every rule of the older syntax as the older implementation did', () => {
+    // A seeded generator (mulberry32), so a failure can be reproduced.
+    let seed = 20261121;
+    const random = () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const pick = <T>(list: readonly T[]) => list[Math.floor(random() * list.length)];
+    // Few distinct pieces, so rules and paths often meet; some are refused, some only encoded alike.
+    const pieces = ['a', 'b', 'A', 'ab', '%61', '%41', 'a%2Fb', '%2F', 'x%2fa', '%2A', '%7B', '%7Bx%7D', '.', '..'];
+    pieces.push('%2e', '', 'a;b', '%20', '%E2%84%AA', 'k', '-', 'a@b', ':x', 'a:x', '%3Ax', '*');
+    const segments = (max: number) => Array.from({ length: Math.floor(random() * (max + 1)) }, () => pick(pieces));
+    const methods = ['GET', 'HEAD', 'POST', 'DELETE', '*', 'get', ''];
+    let compared = 0,
+      matched = 0,
+      refused = 0;
+    for (let i = 0; i < 3000; i++) {
+      const method = pick(methods);
+      const path = '/' + segments(3).join('/') + (random() < 0.15 ? '/' : '') + (random() < 0.4 ? '/*' : '');
+      const text = method ? `${method} ${path}` : path;
+      let legacy: string | undefined, current: string | undefined;
+      try {
+        legacy = legacyParseRule(text, '*').text;
+      } catch {
+        // Stays undefined: the older implementation refused it.
+      }
+      try {
+        current = parseRule(text, '*').text;
+      } catch (e) {
+        expect(e).toMatchObject({ code: 'invalid_rule' });
+      }
+      expect(current, text).toBe(legacy);
+      if (!legacy) {
+        refused++;
+        continue;
+      }
+      for (let j = 0; j < 10; j++) {
+        const raw = '/' + segments(4).join('/') + (random() < 0.15 ? '/' : '');
+        let decoded: string;
+        try {
+          decoded = canonicalPath(raw);
+        } catch {
+          continue;
+        }
+        const requestMethod = pick(METHODS);
+        const expected = legacyMatchRule([legacy], requestMethod, decoded);
+        expect(matchRule([legacy], requestMethod, decoded), `${legacy} ${requestMethod} ${raw}`).toBe(expected);
+        expect(matchRule([legacy], requestMethod, decoded, raw), `${legacy} ${requestMethod} ${raw}`).toBe(expected);
+        expect(matchRule([legacy], requestMethod, decoded, raw, true), `${legacy} ${requestMethod} ${raw}`).toBe(
+          expected,
+        );
+        compared++;
+        if (expected) matched++;
+      }
+    }
+    // Enough of each kind that the comparison means something.
+    expect(compared).toBeGreaterThan(5000);
+    expect(matched).toBeGreaterThan(500);
+    expect(refused).toBeGreaterThan(300);
+  });
+
+  it('bounds the worst case: a path of 2048 characters against 150 rules of the longest kind', () => {
+    // After every segment the ** takes, the 155 literals behind it are compared again, and since no
+    // segment is b each rule fails only at the end: about 1023 × 156 steps per rule and reading.
+    const rule = '/**' + '/a'.repeat(155) + '/b';
+    expect(`GET ${rule}`.length).toBeLessThanOrEqual(320);
+    // The encoded slash makes both readings count: 1023 segments decoded, 1022 as sent.
+    const path = '/' + Array(1021).fill('a').join('/') + '/a%2Fa';
+    expect(path.length).toBe(2048);
+    const many = (method: string) => Array<string>(50).fill(`${method} ${rule}`);
+    const policy = { paths: ['/'], methods: [...METHODS], deny: many('*'), approval: many('*'), free: many('GET') };
+    const started = performance.now();
+    expect(decide(policy, 'GET', path, []).code).toBe('run');
+    expect(performance.now() - started).toBeLessThan(1000);
   });
 });
 
@@ -402,6 +691,95 @@ describe('connection policy decisions', () => {
         invokeInput.parse({ connection: conn, path: '/v1/public/a' }),
       ),
     ).rejects.toMatchObject({ code: 'insufficient_scope', status: 403 });
+  });
+
+  it('reads an encoded slash as sent for a deny rule on a real request, not only in decide', async () => {
+    await grant();
+    await env.DB.prepare('UPDATE connections SET policy_json=? WHERE id=?')
+      .bind(JSON.stringify({ ...policy, deny: ['DELETE /v1/projects/{id}'] }), conn)
+      .run();
+    await expect(call({ method: 'DELETE', path: '/v1/projects/group%2Fproject' })).rejects.toMatchObject({
+      code: 'path_denied',
+      message: expect.stringContaining('"deny DELETE /v1/projects/{id}"'),
+    });
+    await expect(submit({ method: 'DELETE', path: '/v1/projects/group%2Fproject' })).rejects.toMatchObject({
+      code: 'path_denied',
+    });
+    expect((await call({ method: 'DELETE', path: '/v1/projects/group%2Fproject/issues/1' })).status).toBe(200);
+    expect(upstream).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('query parameters that rewrite the method', () => {
+  const target = () => new URL('https://api.example.com/v1');
+  const refused = {
+    code: 'invalid_query',
+    status: 400,
+    message: expect.stringContaining('real method'),
+  };
+
+  it.each([
+    '$httpMethod',
+    '$HTTPMETHOD',
+    '$httpmethod',
+    '_method',
+    '_METHOD',
+    '_Method',
+    '_HttpMethod',
+    '_httpmethod',
+    '$httpHeaders',
+    '$HTTPHEADERS',
+  ])('refuses %j, compared ignoring case', (name) => {
+    expect(() =>
+      appendQuery(target(), [
+        ['q', '1'],
+        [name, 'POST'],
+      ]),
+    ).toThrow(expect.objectContaining({ ...refused, message: expect.stringContaining(`"${name}"`) }));
+  });
+
+  it('lets names that only look alike through', () => {
+    const url = target();
+    appendQuery(url, [
+      ['httpMethod', '1'],
+      ['method', '1'],
+      ['$httpMethods', '1'],
+      ['x_method', '1'],
+      ['%24httpMethod', '1'],
+    ]);
+    // A name is encoded as given, so "%24httpMethod" reaches the upstream as itself, not as $httpMethod.
+    expect(url.search).toBe('?httpMethod=1&method=1&%24httpMethods=1&x_method=1&%2524httpMethod=1');
+  });
+
+  it('refuses them on every way in: REST proxy, http.request and an invocation request, grant or not', async () => {
+    await grant();
+    const rest = (query: string) =>
+      parseProxyRequest(new Request(`https://vault.example.com/v1/proxy/${conn}/v1/public/list?${query}`), conn).then(
+        (parsed) => invoke(env, principal, parsed),
+      );
+    // The REST proxy hands over the names URLSearchParams decoded.
+    for (const query of [
+      '%24httpMethod=POST',
+      '%24HTTPMETHOD=POST',
+      '$httpMethod=POST',
+      '_Method=DELETE',
+      'a=1&_method=PUT',
+    ])
+      await expect(rest(query), query).rejects.toMatchObject(refused);
+    // A free rule, a grant and a one-time approval are all past this check: submission refuses too.
+    await expect(call({ path: '/v1/public/list', query: { $httpMethod: 'POST' } })).rejects.toMatchObject(refused);
+    await expect(call({ path: '/v1/items', query: { _HttpMethod: 'DELETE' } })).rejects.toMatchObject(refused);
+    await expect(submit({ path: '/v1/items', query: { $HttpMethod: 'POST' } })).rejects.toMatchObject(refused);
+    await expect(
+      submit({ path: '/v1/items', query: { $httpHeaders: 'X-HTTP-Method-Override:POST' } }),
+    ).rejects.toMatchObject(refused);
+    expect(await env.DB.prepare('SELECT 1 FROM access_requests').first()).toBeNull();
+    expect(upstream).not.toHaveBeenCalled();
+    // Encoded twice it decodes once, to a name the upstream reads literally.
+    expect((await rest('%2524httpMethod=POST')).status).toBe(200);
+    expect(String((upstream.mock.calls[0] as unknown[])[0])).toBe(
+      'https://api.example.com/v1/public/list?%2524httpMethod=POST',
+    );
   });
 });
 
@@ -1047,6 +1425,24 @@ describe('MCP tool errors', () => {
         },
       }),
     ).toMatchObject({ error: 'use_path_prefix_not_glob', hint: expect.stringContaining('literal prefix') });
+  });
+
+  it('refuses a query parameter that rewrites the method, on http.request and access.request', async () => {
+    const rewritten = {
+      connection: conn,
+      method: 'GET',
+      path: '/v3/projects/p:setIamPolicy',
+      query: { $HTTPMETHOD: 'POST' },
+    };
+    const refused = {
+      status: 200,
+      isError: true,
+      error: 'invalid_query',
+      hint: expect.stringContaining('real method'),
+    };
+    expect(await tool('http.request', rewritten)).toMatchObject(refused);
+    expect(await tool('access.request', { requested: { invocation: rewritten } })).toMatchObject(refused);
+    expect(upstream).not.toHaveBeenCalled();
   });
 
   it('takes an origin on http.request and access.request, naming the host a connection does not list', async () => {

@@ -23,6 +23,7 @@ coverage/
 *.db-shm
 *.log
 *.pem
+!tests/fixtures/keys/**/*.pem
 *.p12
 *.pfx
 *.key
